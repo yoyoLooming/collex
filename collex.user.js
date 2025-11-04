@@ -72,7 +72,9 @@
             Utils.init(() => this.settingsManager.get('enableDebugMode'))
             this.rangeManager = new RangeManager();
             this.cardManager = new CardManager();
-            this.dictManager = new DictManager();
+            this.dictManager = new DictManager(
+                this.settingsManager.get.bind(this.settingsManager),
+            );
             this.eventManager = new EventManager(
                 this.settingsManager.get.bind(this.settingsManager),
                 this.cardManager.cardExists.bind(this.cardManager),
@@ -83,7 +85,6 @@
                 this.queryFromSelection.bind(this),
                 this.rangeManager.resetLastSelection.bind(this.rangeManager)
             );
-
             this.init();
         }
 
@@ -107,10 +108,20 @@
         }
 
         async queryWord(range) {
-            let info = this.rangeManager.extractContext(range);
+            Utils.debug_log('[app] [query range]' + range.toString())
+            let info = {
+                pre: null,
+                word: null,
+                post: null,
+                meaning: null,
+                url: null,
+                title: null,
+                favicon: null,
+            };
+            Object.assign(info, this.rangeManager.extractContext(range))
+            Utils.debug_log("[app] [info]" + JSON.stringify(info))
             Object.assign(info, Utils.collectContext())
-            Object.assign(info, this.dictManager.query(info))
-
+            info.meaning = this.dictManager.query(info)
             const pos = this.rangeManager.getRangeCorners()
             this.cardManager.createCard(pos, info)
         }
@@ -120,7 +131,95 @@
      */
     class DictManager {
         async query(context) {
-            return "todo"
+            /* context = {
+                pre: null,
+                word: null,
+                post: null,
+                url: null,
+                title: null,
+                favicon: null,
+            };
+            */
+            // "meaning xxx"
+            return this.dict_ai(context);
+        }
+
+        async dict_ai(context) {
+            const DEEPSEEK_API_KEY = ""; // 请替换为你的API密钥
+            const DEEPSEEK_API_URL = "https://api.deepseek.com/chat/completions"; // DeepSeek API端点
+
+            try {
+                // 构建完整的句子
+                const fullSentence = `${context.pre || ''} [ ${context.word} ] ${context.post || ''}`.trim();
+
+                // 构建提示词，明确要求单词解释
+                let prompt = `"${fullSentence}"\n请解释上面句子中"${context.word}"这个词的含义\n`;
+                // 可选：添加辅助信息（根据实验效果决定是否使用）
+                const additionalInfo = [];
+                if (context.title) additionalInfo.push(`标题: ${context.title}`);
+
+                if (additionalInfo.length > 0) {
+                    prompt += `\n\n辅助信息:\n${additionalInfo.join('\n')}`;
+                }
+
+                const requestBody = {
+                    model: "deepseek-chat", // 根据可用的模型调整
+                    messages: [
+                        {
+                            role: "system",
+                            content: `
+你是一个专业的语言教师，专注于提供单词在具体语境中的准确解释。
+用户的英语水平是中高级学习者, 了解常见的语言知识.
+如果用户询问的phrase是一个单词或者很常用的固定搭配, 就请首先, 
+在这个单词的所有的通用解释(就是和语境无关, 会在词典中看到的那样)中选择那个当前语境使用了的那个释义,
+并用英语提供, 使用vocabulary.com风格;
+然后再结合语境(意思不是解释语境这句话, 而是说你给的词要蕴含着语境的信息, 这要求你选择最恰当的那个词), 用中文, 只用一个词来解释用户询问的东西.
+else, 如果用户提供的phrase是一个句子, 或者不完整的句子, 并不是固定搭配, 就请简单提供它的中文翻译.
+如果用户提交的phrase涉及到的单词非常简单, 那么他也许是不明白其中涉及到的概念, 请你解释一下.
+我希望输出结果不要带有markdown标点. `
+                        },
+                        {
+                            role: "user",
+                            content: prompt
+                        }
+                    ],
+                    max_tokens: 500,
+                    stream: false,
+                    temperature: 0.5 // 较低的温度以获得更确定的回答
+                };
+
+                const response = await fetch(DEEPSEEK_API_URL, {
+                    method: "POST",
+                    headers: {
+                        "Content-Type": "application/json",
+                        "Authorization": `Bearer ${DEEPSEEK_API_KEY}`
+                    },
+                    body: JSON.stringify(requestBody)
+                });
+
+                if (!response.ok) {
+                    throw new Error(`API请求失败: ${response.status} ${response.statusText}`);
+                }
+
+                const data = await response.json();
+
+                // 提取回答内容
+                const meaning = data.choices[0]?.message?.content?.trim();
+
+                if (!meaning) {
+                    throw new Error("未能获取有效的解释");
+                }
+
+                Utils.debug_log(`[dict manager] [ask ai] deepseek: ${meaning}`)
+
+                return meaning;
+
+            } catch (error) {
+                Utils.debug_log("[dict manager] [fetch] 调用DeepSeek API时出错:" + error);
+
+                // 降级方案：返回基本解释或错误信息
+                return `无法获取"${context.word}"的解释。错误: ${error.message}`
+            }
         }
         /**
          * 查询词典 API
@@ -304,17 +403,17 @@
                 range.startContainer, range.startOffset,
                 range.endContainer, range.endOffset,
                 range.commonAncestorContainer);
-
+            Utils.debug_log('[range manager] [word range x]' + JSON.stringify(wordRangeX))
             const fullText = wordRangeX.containerNode.textContent; // 或 textNode.nodeValue
             const selectedWord = fullText.slice(wordRangeX.startOffset, wordRangeX.endOffset);
-            Utils.debug_log('[range manager]', 'selected text:', selectedWord);
+            Utils.debug_log('[range manager]' + 'selected text:' + selectedWord);
 
             // ==== 查找的单词所在句子 ====
             const { pre, post } = this.extractSentence(wordRangeX.containerNode, wordRangeX.startOffset, wordRangeX.endOffset);
-            Utils.debug_log('[range manager]',
-                'Extract sentence',
-                `\n[pre] "${pre}"`,
-                `\n[word]   "${selectedWord}"`,
+            Utils.debug_log('[range manager]' +
+                'Extract sentence' +
+                `\n[pre] "${pre}"` +
+                `\n[word]   "${selectedWord}"` +
                 `\n[post]  "${post}"`);
             return {
                 pre,
@@ -456,6 +555,7 @@
             return range;
         }
         extractSentence = function (containerNode, startOffset, endOffset) {
+            Utils.debug_log(`[range manager] [extract sentence] offsets: [${startOffset}, ${endOffset}] text: ${containerNode.textContent}`)
             const sentenceBoundary = /([.!?])(?=\s+["'“”]?[A-Z]|$)/;
 
             function getFirstTextNode(el) {
@@ -564,7 +664,7 @@
             // 将换行符替换为空格
             before = before.replace(/\n/g, ' ');
             after = after.replace(/\n/g, ' ');
-            
+
 
             // 这段真是完美的代码啊.
             // 打脸了.
@@ -582,8 +682,8 @@
             if (relativeEndIdx !== -1) sentenceEndIdx = relativeEndIdx + 1;
 
             return {
-                before: before.slice(sentenceStartIdx, before.length).trim(),
-                after: after.slice(0, sentenceEndIdx).trim()
+                pre: before.slice(sentenceStartIdx, before.length).trim(),
+                post: after.slice(0, sentenceEndIdx).trim()
             };
         }
 
@@ -595,16 +695,33 @@
             this.CARD_WIDTH = 400;
             this.CARD_HEIGHT = 300;
             this.cardElement = null;
+            this.contentElement = null;
+            this.debugElement = null;
             this.exists = false;
+
             this.create(pos)
-
-
-            // 显示内容
-            this.display(info);
+            this.showLoading();
+            this.renderContent(info);
 
             // 挂载到页面
             document.body.appendChild(this.cardElement);
             this.exists = true;
+        }
+        showLoading() {
+            this.contentElement.innerHTML = `
+            <div style="display: flex; justify-content: center; align-items: center; height: 100%;">
+                <div style="text-align: center;">
+                    <div style="margin-bottom: 8px;">加载中...</div>
+                    <div style="width: 20px; height: 20px; border: 2px solid #f3f3f3; border-top: 2px solid #007cba; border-radius: 50%; animation: spin 1s linear infinite; margin: 0 auto;"></div>
+                </div>
+            </div>
+            <style>
+                @keyframes spin {
+                    0% { transform: rotate(0deg); }
+                    100% { transform: rotate(360deg); }
+                }
+            </style>
+        `;
         }
         create(pos) {
 
@@ -746,89 +863,182 @@
             document.body.appendChild(wrapper);
         };
 
-        setPosition(pos) {
-            const finalPos = this.computePosition(pos, this.CARD_WIDTH, this.CARD_HEIGHT);
-            this.cardElement.style.left = `${finalPos.left}px`;
-            this.cardElement.style.top = `${finalPos.top}px`;
+
+        showError(message) {
+            this.debugElement.innerHTML = `
+            <div style="display: flex; justify-content: center; align-items: center; height: 100%; color: #d32f2f;">
+                <div style="text-align: center;">
+                    <div style="margin-bottom: 8px;">❌</div>
+                    <div>${message}</div>
+                </div>
+            </div>
+        `;
+        }
+        escapeHtml(unsafe) {
+            if (typeof unsafe !== 'string') return unsafe;
+            return unsafe
+                .replace(/&/g, "&amp;")
+                .replace(/</g, "&lt;")
+                .replace(/>/g, "&gt;")
+                .replace(/"/g, "&quot;")
+                .replace(/'/g, "&#039;")
+                ;
         }
 
-        bindEvents() {
-            // 关闭事件
-            this.closeHandle.addEventListener('click', () => this.destroy());
+        async renderContent(info) {
 
-            // 缩放逻辑
-            let isResizing = false;
-            this.resizeHandle.addEventListener('mousedown', (e) => {
-                e.preventDefault();
-                e.stopPropagation();
-                isResizing = true;
-            });
-
-            // 移动逻辑
-            let isMoving = false;
-            let offsetX = 0, offsetY = 0;
-            this.moveHandle.addEventListener('mousedown', (e) => {
-                e.preventDefault();
-                e.stopPropagation();
-                isMoving = true;
-                const rect = this.cardElement.getBoundingClientRect();
-                offsetX = e.clientX - rect.left;
-                offsetY = e.clientY - rect.top;
-            });
-
-            // 全局鼠标事件
-            const handleMouseMove = (e) => {
-                if (isResizing) {
-                    const newWidth = e.clientX - this.cardElement.getBoundingClientRect().left;
-                    const newHeight = e.clientY - this.cardElement.getBoundingClientRect().top;
-                    this.container.style.width = Math.max(newWidth, 100) + 'px';
-                    this.container.style.height = Math.max(newHeight, 80) + 'px';
-                } else if (isMoving) {
-                    this.cardElement.style.left = (e.clientX - offsetX) + 'px';
-                    this.cardElement.style.top = (e.clientY - offsetY) + 'px';
-                }
-            };
-
-            const handleMouseUp = () => {
-                isResizing = false;
-                isMoving = false;
-            };
-
-            document.addEventListener('mousemove', handleMouseMove);
-            document.addEventListener('mouseup', handleMouseUp);
-
-            // 保存引用以便后续移除
-            this._mouseMoveHandler = handleMouseMove;
-            this._mouseUpHandler = handleMouseUp;
-        }
-
-        display(info) {
-            if (info) {
-                this.renderContent(info);
-            }
-        }
-
-        renderContent(info) {
-            // 根据你的 info 结构来渲染内容
+            info.meaning = await info.meaning;
             let contentHTML = '';
 
-            if (info.before || info.selectedWord || info.after) {
-                contentHTML = `
-                <div class="sentence">
-                    ${info.before || ''} 
-                    <span class="highlight">${info.selectedWord || ''}</span>
-                    ${info.after || ''}
+            // 标题区域（如果有标题信息）
+            if (info.title || info.siteName) {
+                contentHTML += `
+                <div style="margin-bottom: 16px; border-bottom: 1px solid #eee; padding-bottom: 12px;">
+                    ${info.title ? `<div style="font-weight: bold; font-size: 16px; margin-bottom: 4px;">${this.escapeHtml(info.title)}</div>` : ''}
+                    ${info.siteName ? `<div style="font-size: 12px; color: #666;">${this.escapeHtml(info.siteName)}</div>` : ''}
                 </div>
             `;
-            } else {
-                contentHTML = '<p>No content available</p>';
             }
 
+            // 核心词汇信息
+            contentHTML += `
+            <div style="margin-bottom: 16px;">
+                ${info.pre ? `<span style="color: #666;">${this.escapeHtml(info.pre)}</span>` : ''}
+                <span style="font-weight: bold; color: #007cba; background: #f0f8ff; padding: 2px 4px; border-radius: 3px;">${this.escapeHtml(info.word || '')}</span>
+                ${info.post ? `<span style="color: #666;">${this.escapeHtml(info.post)}</span>` : ''}
+            </div>
+        `;
+
+            // 词义解释
+            if (info.meaning) {
+                contentHTML += `
+                <div style="margin-bottom: 16px;">
+                    <div style="font-weight: bold; margin-bottom: 8px; color: #333;">释义</div>
+                    <div style="color: #555; line-height: 1.5;">${this.escapeHtml(info.meaning)}</div>
+                </div>
+            `;
+            }
+
+            // 如果没有核心内容，显示提示
+            if (!info.word && !info.meaning) {
+                contentHTML = `
+                <div style="display: flex; justify-content: center; align-items: center; height: 100%; color: #666;">
+                    <div style="text-align: center;">
+                        <div>暂无可用信息</div>
+                    </div>
+                </div>
+            `;
+            }
+            contentHTML += `
+    <div style="margin-top: 20px; text-align: center;">
+        <button id="add-to-anki-btn"
+            style="background-color: #007cba; color: white; border: none;
+                   padding: 8px 16px; border-radius: 5px; cursor: pointer;
+                   transition: background-color 0.3s;">
+            添加到 Anki
+        </button>
+    </div>
+`;
             this.contentElement.innerHTML = contentHTML;
 
-            // 调试信息
-            this.debugElement.textContent = JSON.stringify(info, null, 2);
+
+            // === 绑定按钮事件 ===
+            const btn = this.contentElement.querySelector("#add-to-anki-btn");
+            const openAnkiNote = (noteId) => {
+                const browsePayload = {
+                    action: "guiBrowse",
+                    version: 6,
+                    params: {
+                        query: `nid:${noteId}` // 使用 note ID 进行查询
+                    }
+                };
+
+                // 尝试发送请求到 AnkiConnect
+                fetch("http://127.0.0.1:8765", {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify(browsePayload)
+                })
+                    .then(response => response.json())
+                    .then(result => {
+                        if (result.error) {
+                            console.error("AnkiConnect guiBrowse Error:", result.error);
+                            // 可以在这里给用户一些反馈，比如一个短暂的提示
+                        } else {
+                            console.log("Successfully opened Anki browser to note:", noteId);
+                        }
+                    })
+                    .catch(err => {
+                        console.error("Fetch Error for guiBrowse:", err);
+                    });
+            };
+            if (btn) {
+                btn.onclick = async () => {
+                    btn.style.backgroundColor = "#f1c40f"; // 黄色：发送中
+                    btn.textContent = "正在发送...";
+                    const payload = {
+                        action: "addNote",
+                        version: 6,
+                        params: {
+                            note: {
+                                deckName: "read",
+                                modelName: "collex",
+                                fields: {
+                                    word: info.word || '',
+                                    pre: info.pre || '',
+                                    post: info.post || '',
+                                    meaning: Utils.wrapHTML(info.meaning) || '',
+                                    url: info.url || '',
+                                    title: info.title || '',
+                                    favicon: info.favicon || '',
+                                },
+                            }
+                        }
+                    };
+
+                    try {
+                        const response = await fetch("http://127.0.0.1:8765", {
+                            method: "POST",
+                            headers: { "Content-Type": "application/json" },
+                            body: JSON.stringify(payload)
+                        });
+                        const result = await response.json();
+
+                        if (result.error) {
+                            console.error("AnkiConnect Error:", result.error);
+                            btn.style.backgroundColor = "#e74c3c"; // 红色：失败
+                            btn.textContent = "添加失败";
+                        } else {
+                            // 🚀 成功处理部分的关键修改
+                            const newNoteId = result.result; // AnkiConnect 成功返回 noteId
+
+                            btn.style.backgroundColor = "#2ecc71"; // 绿色：成功
+                            btn.textContent = "添加成功, 点击查看";
+
+                            // 移除旧的点击事件监听器（如果它还存在）
+                            // 注意：为了简单，这里直接用新的替换，但如果需要防止内存泄漏，
+                            // 更好的做法是在添加新的监听器前移除旧的，或者使用一次性监听器。
+
+                            // 移除旧的（发送）事件监听器
+                            // 由于您在函数作用域内，直接替换其功能更简单:
+                            // btn.onclick = null; // 清除当前行内或绑定的任何 click 处理器
+
+                            // // 绑定新的点击事件：打开 Anki
+                            // btn.addEventListener("click", () => {
+                            //     openAnkiNote(newNoteId);
+                            // }, { once: true }); // 使用 once: true 确保只绑定一次
+
+                            btn.onclick = () => openAnkiNote(newNoteId)
+                        }
+                    } catch (err) {
+                        console.error("Fetch Error:", err);
+                        btn.style.backgroundColor = "#e74c3c";
+                        btn.textContent = "连接失败";
+                    }
+                };
+            }
         }
+
 
         computePosition(pos, cardWidth, cardHeight) {
             const viewportWidth = window.innerWidth;
@@ -1040,12 +1250,38 @@
             return {
                 url: location.href,
                 title: document.title,
-                domain: location.hostname,
                 favicon: document.querySelector('link[rel~="icon"]')?.href || '',
-                author: document.querySelector('meta[name="author"]')?.content || '',
-                siteName: document.querySelector('meta[property="og:site_name"]')?.content || '',
-                publicationDate: document.querySelector('meta[name="date"], meta[property="article:published_time"]')?.content || '',
             };
+        }
+        /**
+         * 将字符串用<div>标签包裹，并将每段用<p>标签包裹
+         * 
+         * @param {string} text - 输入的字符串
+         * @returns {string} 处理后的HTML字符串
+         */
+        static wrapHTML(text) {
+
+            if (!text || !text.trim()) {
+                return "<div></div>";
+            }
+
+            // 分割字符串为段落（按换行符分割）
+            const paragraphs = text.split('\n');
+
+            // 过滤掉空段落并去除首尾空格
+            const nonEmptyParagraphs = paragraphs
+                .map(p => p.trim())
+                .filter(p => p.length > 0);
+
+            // 用<p>标签包裹每个段落
+            const wrappedParagraphs = nonEmptyParagraphs.map(paragraph =>
+                `<p>${paragraph}</p>`
+            );
+
+            // 将所有段落组合并用<div>标签包裹
+            const result = `<div>${wrappedParagraphs.join('')}</div>`;
+
+            return result;
         }
 
     }
