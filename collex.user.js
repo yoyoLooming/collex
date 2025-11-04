@@ -1,6 +1,6 @@
 // ==UserScript==
 // @name         采词
-// @version      0.7.4
+// @version      0.8
 // @description  可以在阅读中学习单词.
 // @match        *://*/*
 // @grant        GM_getValue
@@ -35,6 +35,12 @@
  *                    设计了查词前端api的结构: 一个中间件请求后端或网络api获取单词信息, 转换为json格式提供给前端卡片渲染.
  *  25/08/17  v0.7.3  初步实现卡片的展示函数
  *  25/08/17  v0.7.4  完成移除卡片和避免重复打开卡片的逻辑
+ *  25/11/02  v0.8    0.8版本要重构代码!!!!!!!!
+ *                    将项目结构重构为 app 和几个 manager:
+ *                      dict, settings, selection, utils, card.
+ *  25/11/03  v0.9    懒得继续重构了. 重构完, 写了一天, 没bug了, 所以继续写新功能了.
+ *                    新功能将会暂时很简单. 释义直接问ai, 然后直接投入到anki的连接里面.
+ *                    还需要重新写一下展示卡片位置的事情. 直接传入rects吧.
 
 任务
 1. [功能]完成与后端的连接
@@ -45,7 +51,7 @@
     4.2 需要写好与anki的字段的对应
     4.3 需要在浏览器上再采集一些信息(url, 网页title, 甚至截图)
 5. [优化]拆分选停选词和按键选词在监听事件中的逻辑
-6. [优化]重写debugLog, 一方面更规范化方便调试时的filter, 一方面给debug分级.
+6. [优化]重写Utils.debug_log, 一方面更规范化方便调试时的filter, 一方面给debug分级.
 5. [优化]调整卡片出现的位置
     5.1 出现位置由鼠标决定修改为选区的四个角座标决定
     5.2 默认右下角, 如果下方没有位置出现在右上角, 右方没有位置出现在左上角, 都没有位置仍然右下角.
@@ -59,131 +65,569 @@
 
 (function () {
     'use strict';
-    // ======== 全局对象 ========
-    const g_selection = window.getSelection();
-    const g_card = {
-        cardElement: null,
-        contentElement: null,
-        debugElement: null,
-        exists: false,
-        containsPoint(x, y) {
-            if (!this.cardElement || !this.exists) return false;
-            // 获取卡片在视口中的位置和尺寸（包含 Shadow DOM 内部元素）
-            const rect = this.cardElement.getBoundingClientRect();
-            // 基础边界检查
-            const isInBounds = (
-                x >= rect.left &&
-                x <= rect.right &&
-                y >= rect.top &&
-                y <= rect.bottom
+
+    class CollexApp {
+        constructor() {
+            this.settingsManager = new SettingsManager();
+            Utils.init(() => this.settingsManager.get('enableDebugMode'))
+            this.rangeManager = new RangeManager();
+            this.cardManager = new CardManager();
+            this.dictManager = new DictManager();
+            this.eventManager = new EventManager(
+                this.settingsManager.get.bind(this.settingsManager),
+                this.cardManager.cardExists.bind(this.cardManager),
+                this.cardManager.isPointInCard.bind(this.cardManager),
+                this.cardManager.isMouseInCard.bind(this.cardManager),
+                this.cardManager.removeCard.bind(this.cardManager),
+                this.queryFromPoint.bind(this),
+                this.queryFromSelection.bind(this),
+                this.rangeManager.resetLastSelection.bind(this.rangeManager)
             );
-            return isInBounds;
-        },
-        fetchDict: {
-            cobuild: async function(word, before = null, after = null) {
-                const url = `http://127.0.0.1:5000/query?dict=COBUILD&q=${encodeURIComponent(word)}`;
-                try {
-                    const controller = new AbortController();
-                    const timeoutId = setTimeout(() => controller.abort(), 3000);
-                    const response = await fetch(url, {
-                        signal: controller.signal,
-                        headers: { 'Accept': 'text/plain' }
-                    });
-                    clearTimeout(timeoutId);
-                    if (!response.ok) {
-                        throw new Error(`HTTP error! status: ${response.status}`);
-                    }
-                    return await response.text();
-                } catch (error) {
-                    console.error('[Dict Fetch Error]', error);
-                    return Promise.reject(`查询失败: ${error.message || '未知错误'}`);
+
+            this.init();
+        }
+
+        init() {
+            this.settingsManager.load();
+            this.eventManager.bindEvents();
+            this.settingsManager.registerMenus();
+        }
+
+        queryFromPoint(x, y) {
+
+            const wordRange = this.rangeManager.getRangeFromPoint(x, y)
+            if (wordRange === null) return;
+            if (this.rangeManager.tryUpdateSelectionbyPoint(wordRange)) this.queryWord(wordRange)
+        }
+
+        queryFromSelection() {
+            if (!this.rangeManager.selectionExists()) return;
+            const wordRange = this.rangeManager.getSelectedRange();
+            this.queryWord(wordRange)
+        }
+
+        async queryWord(range) {
+            let info = this.rangeManager.extractContext(range);
+            Object.assign(info, Utils.collectContext())
+            Object.assign(info, this.dictManager.query(info))
+
+            const pos = this.rangeManager.getRangeCorners()
+            this.cardManager.createCard(pos, info)
+        }
+    };
+    /**
+     * 词典管理
+     */
+    class DictManager {
+        async query(context) {
+            return "todo"
+        }
+        /**
+         * 查询词典 API
+         * @param {string} word 要查询的单词
+         * @param {string} dictName 词典类型 (默认 'collins')
+         * @param {number} timeout 超时时间 (默认 3000ms)
+         * @returns {Promise<string>} 返回原始字符串数据
+         */
+        fetchDict = async function (word, dictName = 'COBUILD', timeout = 3000) {
+            const url = `http://127.0.0.1:5000/query?dict=${encodeURIComponent(dictName)}&q=${encodeURIComponent(word)}`;
+            try {
+                const controller = new AbortController();
+                const timeoutId = setTimeout(() => controller.abort(), timeout);
+                const response = await fetch(url, {
+                    signal: controller.signal,
+                    headers: { 'Accept': 'text/plain' }
+                });
+                clearTimeout(timeoutId);
+                if (!response.ok) {
+                    throw new Error(`HTTP error! status: ${response.status}`);
                 }
-                //},
-                const data = await WebUtils.fetchDict(word)
-                this.debugShow(data);
-            },
-        }, // 用来将词典提供的各种结构的数据转换成统一结构的json数据
-        debugShow(html_debuginfo) {
-            if (!this.debugElement || !html_debuginfo) return;
-            debugLog('按键/定位/获取/处理/请求/格式', html_debuginfo)
-            const debugItem = document.createElement('p');
-            debugItem.innerHTML = html_debuginfo;
-            this.debugElement.appendChild(debugItem);
-        },
-        contentShow(json_content) {
-            if (!this.contentElement || !json_content) return;
-            this.debugShow(json_content);
-
-            // Create combined sentence with highlighted word
-            const html = `
-                    <div class="word-card">
-                        <div class="sentence">
-                            ${json_content.before || ''}
-                            <span class="highlight-word">${json_content.word || ''}</span>
-                            ${json_content.after || ''}
-                        </div>
-                    </div>
-                `;
-
-            // insert
-            this.contentElement.innerHTML = html;
-
-            // Add styling
-            const style = document.createElement('style');
-            style.textContent = `
-                    .word-card {
-                        padding: 10px;
-                        font-family: Arial, sans-serif;
-                        line-height: 1.5;
-                        text-align: left; /* 强制左对齐 */
-                    }
-                    .sentence {
-                        word-break: break-word;
-                    }
-                    .highlight-word {
-                        font-weight: bold;
-                        color: #0066cc;
-                        background-color: rgba(0, 102, 204, 0.1);
-                        padding: 2px 1px;
-                        border-radius: 3px;
-                    }
-                `;
-            this.contentElement.appendChild(style);
-        },
-        remove: function() {
-            if (!this.exists || this.cardElement === null) {
-                debugLog('按键/定位/获取/处理/请求/格式/结束', 'error', 'remove card but the card does not exist');
-                return;
+                return await response.text();
+            } catch (error) {
+                console.error('[Dict Fetch Error]', error);
+                return Promise.reject(`查询失败: ${error.message || '未知错误'}`);
             }
-            this.cardElement.remove();
-            this.exists = false;
+        }
+    }
+    // ======== 设置管理 ========
+    class SettingsManager {
+        constructor() {
+            this.defaultSettings = {
+                hotkey: 'Control',
+                enableMouseSelection: true,
+                enableHoverSelection: true,
+                enableDebugMode: false
+            };
+            this.settings = {};
+        }
+
+        load() {
+            const loaded = {};
+            for (const key in this.defaultSettings) {
+                loaded[key] = GM_getValue(key, this.defaultSettings[key]);
+            }
+            this.settings = loaded;
+            return this.settings;
+        }
+
+        save() {
+            for (const key in this.settings) {
+                GM_setValue(key, this.settings[key]);
+            }
+        }
+
+        get(key) {
+            return this.settings[key];
+        }
+
+        set(key, value) {
+            this.settings[key] = value;
+            this.save();
+        }
+
+        toggle(key) {
+            this.settings[key] = !this.settings[key];
+            this.save();
+            return this.settings[key];
+        }
+
+        registerMenus() {
+            GM_registerMenuCommand(`启用 Debug Mode: ${this.get('enableDebugMode') ? '✅' : '❌'}`, () => {
+                this.toggle('enableDebugMode');
+                this.registerMenus(); // 刷新菜单
+            }, { id: 'enable-debug-mode' });
+
+            GM_registerMenuCommand(`启用 鼠标选择: ${this.get('enableMouseSelection') ? '✅' : '❌'}`, () => {
+                this.toggle('enableMouseSelection');
+                this.registerMenus();
+            }, { id: 'enable-mouse-selection' });
+
+            GM_registerMenuCommand(`启用 悬浮选择: ${this.get('enableHoverSelection') ? '✅' : '❌'}`, () => {
+                this.toggle('enableHoverSelection');
+                this.registerMenus();
+            }, { id: 'enable-hover-selection' });
+
+            GM_registerMenuCommand(`设置快捷键 (当前: ${this.get('hotkey')})`, () => {
+                const key = prompt('请输入快捷键名称（例如 Control / Alt / Shift / F2）', this.get('hotkey'));
+                if (key) {
+                    this.set('hotkey', key);
+                    this.registerMenus();
+                }
+            }, { id: 'set-hotkey' });
+        }
+
+        // 便捷方法
+        isDebugEnabled() {
+            return this.get('enableDebugMode');
+        }
+
+        isMouseSelectionEnabled() {
+            ``
+            return this.get('enableMouseSelection');
+        }
+
+        isHoverSelectionEnabled() {
+            return this.get('enableHoverSelection');
+        }
+
+        getHotkey() {
+            return this.get('hotkey');
+        }
+
+        setHotKey(value) {
+            this.set('hotkey', value)
+        }
+    }
+    class RangeManager {
+        constructor() {
+            this.selection = window.getSelection();
+            this.lastRangeFromPoint = null;
+        }
+        getRangeCorners() {
+            const rects = this.selection.getRangeAt(0).getClientRects();
+            const firstRect = rects[0];
+            const lastRect = rects[rects.length - 1];
+
+            return {
+                top_left: {
+                    x: firstRect.left,
+                    y: firstRect.top
+                },
+                top_right: {
+                    x: firstRect.right,
+                    y: firstRect.top
+                },
+                bottom_left: {
+                    x: lastRect.left,
+                    y: lastRect.bottom
+                },
+                bottom_right: {
+                    x: lastRect.right,
+                    y: lastRect.bottom
+                }
+            };
+        }
+        getSelectedRange() {
+            return this.selection.getRangeAt(0);
+        }
+        tryUpdateSelectionbyPoint(range) {
+            if (RangeManager.rangeEquals(range, this.lastRangeFromPoint)) return false;
+            this.lastRangeFromPoint = range
+            this.selection.removeAllRanges();
+            this.selection.addRange(range);
+            return true
+        }
+        resetLastSelection() {
+            this.lastRangeFromPoint = null;
+        }
+        static rangeEquals(range1, range2) {
+            return (
+                range1 !== null && range2 !== null &&
+                range1.startContainer === range2.startContainer &&
+                range1.startOffset === range2.startOffset &&
+                range1.endContainer === range2.endContainer &&
+                range1.endOffset === range2.endOffset
+            );
+        }
+
+        selectionExists() {
+            // todo
+            if (this.selection.rangeCount === 0) return false;
+            const wordRange = this.selection.getRangeAt(0)
+            if (wordRange.toString().trim() === "") return false;
+            return true
+        }
+
+        extractContext(range) {
+            // node, startOffset, endOffset
+            const wordRangeX = this.getRangeOffsetsInCommonAncestor(
+                range.startContainer, range.startOffset,
+                range.endContainer, range.endOffset,
+                range.commonAncestorContainer);
+
+            const fullText = wordRangeX.containerNode.textContent; // 或 textNode.nodeValue
+            const selectedWord = fullText.slice(wordRangeX.startOffset, wordRangeX.endOffset);
+            Utils.debug_log('[range manager]', 'selected text:', selectedWord);
+
+            // ==== 查找的单词所在句子 ====
+            const { pre, post } = this.extractSentence(wordRangeX.containerNode, wordRangeX.startOffset, wordRangeX.endOffset);
+            Utils.debug_log('[range manager]',
+                'Extract sentence',
+                `\n[pre] "${pre}"`,
+                `\n[word]   "${selectedWord}"`,
+                `\n[post]  "${post}"`);
+            return {
+                pre,
+                word: selectedWord,
+                post,
+            }
+        }
+
+        getRangeOffsetsInCommonAncestor = function (startContainer, startOffset, endContainer, endOffset, rootContainer) {
+            if (!rootContainer || !(rootContainer instanceof Node)) {
+                throw new Error('rootContainer 必须是 Node 对象');
+            }
+
+            let foundStart = false;
+            let foundEnd = false;
+            let charCount = 0;
+            let startCharOffset = null;
+            let endCharOffset = null;
+
+            // 递归遍历 rootContainer 下所有文本节点，累计字符长度
+            function traverse(node) {
+                if (foundEnd) return; // 都找到了就停止遍历
+
+                if (node.nodeType === Node.TEXT_NODE) {
+                    if (!foundStart && node === startContainer) {
+                        startCharOffset = charCount + startOffset;
+                        foundStart = true;
+                    }
+                    if (!foundEnd && node === endContainer) {
+                        endCharOffset = charCount + endOffset;
+                        foundEnd = true;
+                    }
+                    charCount += node.textContent.length;
+                } else {
+                    for (let child of node.childNodes) {
+                        traverse(child);
+                        if (foundEnd) break;
+                    }
+                }
+            }
+
+            traverse(rootContainer);
+
+            if (startCharOffset === null || endCharOffset === null) {
+                throw new Error('未能在公共祖先节点内找到 Range 的起止容器');
+            }
+
+            return {
+                containerNode: rootContainer,
+                startOffset: startCharOffset,
+                endOffset: endCharOffset,
+            };
+        }
+
+        getRangeFromPoint(x, y) {
+            const caret = document.caretPositionFromPoint(x, y)
+            if (!caret) return null;
+
+            let node = caret.offsetNode;
+            let offset = caret.offset;
+
+            // 如果不是文本节点，尝试找第一个文本节点
+            if (node.nodeType !== Node.TEXT_NODE) {
+                let walker = document.createTreeWalker(node, NodeFilter.SHOW_TEXT, null);
+                node = walker.nextNode();
+                if (!node) return null;
+                offset = 0;
+            }
+
+            const text = node.textContent;
+            if (!text) return null;
+
+            // 匹配字符规则：字母、数字、下划线、横杠
+            const isWordChar = (ch) => /[A-Za-z0-9_-]/.test(ch);
+
+            // 找左边界
+            let start = offset;
+            while (start > 0 && isWordChar(text[start - 1])) start--;
+
+            // 找右边界
+            let end = offset;
+            while (end < text.length && isWordChar(text[end])) end++;
+
+            // 避免单词开头或结尾出现横杠
+            while (start < end && text[start] === '-') start++;
+            while (end > start && text[end - 1] === '-') end--;
+
+            if (start >= end) return null; // 没有有效单词
+
+            // 创建 range
+            const range = document.createRange();
+            range.setStart(node, start);
+            range.setEnd(node, end);
+
+            return range;
+        }
+
+        // 选择单词
+        // 返回range
+        getWordRangeFromCaret = function (caret) {
+            if (!caret) return null;
+
+            let node = caret.offsetNode;
+            let offset = caret.offset;
+
+            // 如果不是文本节点，尝试找第一个文本节点
+            if (node.nodeType !== Node.TEXT_NODE) {
+                let walker = document.createTreeWalker(node, NodeFilter.SHOW_TEXT, null);
+                node = walker.nextNode();
+                if (!node) return null;
+                offset = 0;
+            }
+
+            const text = node.textContent;
+            if (!text) return null;
+
+            // 匹配字符规则：字母、数字、下划线、横杠
+            const isWordChar = (ch) => /[A-Za-z0-9_-]/.test(ch);
+
+            // 找左边界
+            let start = offset;
+            while (start > 0 && isWordChar(text[start - 1])) start--;
+
+            // 找右边界
+            let end = offset;
+            while (end < text.length && isWordChar(text[end])) end++;
+
+            // 避免单词开头或结尾出现横杠
+            while (start < end && text[start] === '-') start++;
+            while (end > start && text[end - 1] === '-') end--;
+
+            if (start >= end) return null; // 没有有效单词
+
+            // 创建 range
+            const range = document.createRange();
+            range.setStart(node, start);
+            range.setEnd(node, end);
+
+            return range;
+        }
+        extractSentence = function (containerNode, startOffset, endOffset) {
+            const sentenceBoundary = /([.!?])(?=\s+["'“”]?[A-Z]|$)/;
+
+            function getFirstTextNode(el) {
+                if (el.nodeType === Node.TEXT_NODE) return el;
+                for (let child of el.childNodes) {
+                    let found = getFirstTextNode(child);
+                    if (found) return found;
+                }
+                return null;
+            }
+
+            function getLastTextNode(el) {
+                if (el.nodeType === Node.TEXT_NODE) return el;
+                for (let i = el.childNodes.length - 1; i >= 0; i--) {
+                    let found = getLastTextNode(el.childNodes[i]);
+                    if (found) return found;
+                }
+                return null;
+            }
+
+            function collectBackward(node, offset) {
+                let text = node.textContent.slice(0, offset);
+                let current = node;
+
+                while (true) {
+                    // Utils.debug_log('按键/定位/获取/处理', '[collect backward] 当前节点:', current, '当前文本:', JSON.stringify(text));
+
+                    if (sentenceBoundary.test(text)) {
+                        // Utils.debug_log('按键/定位/获取/处理', '[collect backward] 命中句子边界，停止');
+                        break;
+                    }
+
+                    if (!current.previousSibling) {
+                        // 如果当前节点是行内元素的子节点，则跳到父节点继续向上找
+                        if (
+                            current.parentNode &&
+                            current.parentNode.nodeType === Node.ELEMENT_NODE &&
+                            window.getComputedStyle(current.parentNode).display === 'inline'
+                        ) {
+                            current = current.parentNode;
+                            continue; // 再次尝试 previousSibling
+                        }
+                        break; // 块级元素或到根节点，停止
+                    }
+
+                    current = current.previousSibling;
+
+                    if (current.nodeType === Node.TEXT_NODE) {
+                        text = current.textContent + text;
+                    } else if (current.nodeType === Node.ELEMENT_NODE) {
+                        if (window.getComputedStyle(current).display === 'block') break;
+                        let lastText = getLastTextNode(current);
+                        if (lastText) {
+                            text = lastText.textContent + text;
+                        }
+                    }
+                }
+
+                return text;
+            }
+
+            function collectForward(node, offset) {
+                let text = node.textContent.slice(offset);
+                let current = node;
+
+                while (true) {
+                    // Utils.debug_log('按键/定位/获取/处理', '[collect forward] 当前节点:', current, '当前拼接文本:', JSON.stringify(text));
+
+                    if (sentenceBoundary.test(text)) {
+                        // Utils.debug_log('按键/定位/获取/处理', '[collect forward] 命中句子边界，停止');
+                        break;
+                    }
+
+                    if (!current.nextSibling) {
+                        // 如果父节点是行内元素，则跳到父节点继续向后找
+                        if (
+                            current.parentNode &&
+                            current.parentNode.nodeType === Node.ELEMENT_NODE &&
+                            window.getComputedStyle(current.parentNode).display === 'inline'
+                        ) {
+                            current = current.parentNode;
+                            continue; // 再次尝试 nextSibling
+                        } else {
+                            break; // 块级元素或到根节点，停止
+                        }
+                    }
+
+                    current = current.nextSibling;
+
+                    if (current.nodeType === Node.TEXT_NODE) {
+                        text += current.textContent;
+                    } else if (current.nodeType === Node.ELEMENT_NODE) {
+                        if (window.getComputedStyle(current).display === "block") break;
+                        const firstText = getFirstTextNode(current);
+                        if (firstText) {
+                            text += firstText.textContent;
+                        }
+                    }
+                }
+                return text;
+            }
+
+
+            let before = collectBackward(containerNode, startOffset);
+            let after = collectForward(containerNode, endOffset);
+            // 将换行符替换为空格
+            before = before.replace(/\n/g, ' ');
+            after = after.replace(/\n/g, ' ');
+            
+
+            // 这段真是完美的代码啊.
+            // 打脸了.
+            before = before.trim()
+            after = after.trim()
+            let sentenceStartIdx = 0;
+            let relativeStartIdx = 0;
+            while (relativeStartIdx !== -1) {
+                relativeStartIdx = before.slice(sentenceStartIdx).search(sentenceBoundary)
+                sentenceStartIdx = sentenceStartIdx + relativeStartIdx + 1
+            }
+
+            let sentenceEndIdx = after.length;
+            const relativeEndIdx = after.search(sentenceBoundary);
+            if (relativeEndIdx !== -1) sentenceEndIdx = relativeEndIdx + 1;
+
+            return {
+                before: before.slice(sentenceStartIdx, before.length).trim(),
+                after: after.slice(0, sentenceEndIdx).trim()
+            };
+        }
+
+    }
+
+
+    class WordCard {
+        constructor(pos, info) {
+            this.CARD_WIDTH = 400;
+            this.CARD_HEIGHT = 300;
             this.cardElement = null;
-            this.contentElement= null;
-            this.debugElement= null;
-            debugLog('按键/定位/获取/处理/请求/格式/结束', '-------------')
-        },
-        create: async function(query) {
-            if (this.exists) {
-                debugLog('按键/定位/获取/处理/绘制',  'old card removed')
-                this.remove()
-            }
-            // 外层容器（挂在页面上）
+            this.exists = false;
+            this.create(pos)
+
+
+            // 显示内容
+            this.display(info);
+
+            // 挂载到页面
+            document.body.appendChild(this.cardElement);
+            this.exists = true;
+        }
+        create(pos) {
+
+            const CARD_WIDTH = 400;
+            const CARD_HEIGHT = 300;
+
+            const finalPos = this.computePosition(pos, CARD_WIDTH, CARD_HEIGHT);
+
             const wrapper = document.createElement('div');
             wrapper.style.position = 'fixed';
-            wrapper.style.left = `${mousePos.x}px`;
-            wrapper.style.top = `${mousePos.y}px`;
-            wrapper.style.zIndex = 999999;
+            wrapper.style.left = `${finalPos.left}px`;
+            wrapper.style.top = `${finalPos.top}px`;
+            wrapper.style.zIndex = 999;
 
-            // 创建 Shadow DOM
             const shadow = wrapper.attachShadow({ mode: 'open' });
 
-            // 内部主容器
             const container = document.createElement('div');
-            container.style.width = '400px';
-            container.style.height = '300px';
+            container.style.width = `${CARD_WIDTH}px`;
+            container.style.height = `${CARD_HEIGHT}px`;
             container.style.border = '1px solid #ccc';
             container.style.background = '#f9f9f9';
             container.style.overflow = 'auto';
+            container.style.overflowWrap = 'break-word'
             container.style.boxSizing = 'content-box';
             shadow.appendChild(container);
 
@@ -238,7 +682,7 @@
                     transform: translate(50%, -50%);
                 }
 
-            `;
+                `;
             shadow.appendChild(style);
 
             // 内容区
@@ -300,510 +744,311 @@
             this.cardElement = wrapper;
             this.exists = true;
             document.body.appendChild(wrapper);
-
-
-            const json_content = await this.fetchDict.cobuild(query.word);
-            /*
-            // 请求网络数据并内容填充
-            const json_string = `{
-                "before": ${JSON.stringify(query.before)},
-                "word": ${JSON.stringify(query.word)},
-                "after": ${JSON.stringify(query.after)}
-            }`;
-            const json_content = JSON.parse(json_string);
-            // debugLog('json content:', json_content)
-            */
-            this.contentShow(json_content)
-
-
-        },
-    };
-
-
-    // ======== 默认设置 ========
-    const defaultSettings = {
-        hotkey: 'Control',
-        enableMouseSelection: true,
-        enableHoverSelection: true,
-        enableDebugMode: false
-    };
-    const settings = loadSettings();
-
-    function loadSettings() {
-        const loaded = {};
-        for (const key in defaultSettings) {
-            loaded[key] = GM_getValue(key, defaultSettings[key]);
-        }
-        return loaded;
-    }
-
-    function saveSettings() {
-        for (const key in settings) {
-            GM_setValue(key, settings[key]);
-        }
-    }
-
-
-    // ======== Debug 输出工具 ========
-    function debugLog(category, ...args) {
-        if (settings.enableDebugMode) {
-            console.log(`Collex Debug > [${category}] `, ...args);
-        }
-    }
-
-    // ======== 事件监听 ========
-    let hotkeyPressed = false;
-    let lastWordRange = null;
-    let mousePos = {x: 0, y: 0}
-
-    document.addEventListener('keydown', (e) => {
-        if (isInputTarget(e.target)) return;
-        if (e.key !== settings.hotkey) return;
-        if (hotkeyPressed) return;
-
-        hotkeyPressed = true;
-        debugLog('按键', `Hotkey "${settings.hotkey}" pressed.`, 'Mouse position:', mousePos);
-
-    });
-
-    document.addEventListener('keyup', (e) => {
-        // if (isInputTarget(e.target)) debugLog('input target')
-        if (isInputTarget(e.target)) return;
-        if (e.key !== settings.hotkey) return;
-        hotkeyPressed = false;
-
-        // 判断是否在卡片外部查词.
-        if (g_card.exists && g_card.containsPoint(mousePos.x, mousePos.y)) {
-            debugLog('按键', 'keyup', 'event in card')
-            return;
-        }
-        if (g_card.exists && !g_card.containsPoint(mousePos.x, mousePos.y)) {
-            debugLog('按键', 'keyup', 'event out card')
-        }
-        const caret = document.caretPositionFromPoint(mousePos.x, mousePos.y)
-        debugLog('按键/定位', 'keyup get caret', caret)
-        const wordRange = getWordRangeFromCaret(caret);
-        debugLog('按键/定位/获取', 'get word range', wordRange);
-        if (wordRange === null) return;
-
-        lastWordRange = wordRange
-        g_selection.removeAllRanges();
-        g_selection.addRange(lastWordRange);
-        debugLog('按键/定位/获取', 'current word range changed', lastWordRange)
-        queryWord(wordRange)
-
-
-    });
-
-    let lastMouseLogTime = 0;
-    document.addEventListener('mousemove', (e) => {
-        mousePos = { x: e.clientX, y: e.clientY };
-        if (!settings.enableHoverSelection) return;
-        if (!hotkeyPressed) return;
-        if (isInputTarget(e.target)) return;
-        if (g_card.exists && g_card.cardElement.contains(e.target)) {
-            debugLog('按键', 'mousemove', 'event in card')
-            return;
-        }
-        // if (g_card.exists && !g_card.cardElement.contains(e.target)) debugLog('mousemove', 'event out card')
-        const caret = document.caretPositionFromPoint(mousePos.x, mousePos.y)
-        const wordRange = getWordRangeFromCaret(caret);
-        const currentTime = Date.now();
-        if (currentTime - lastMouseLogTime >= 1000) {
-            lastMouseLogTime = currentTime;
-            debugLog('按键', 'Mouse move under hotkey pressed', mousePos);
-            debugLog('按键/定位', 'Mouse move get caret', caret);
-            debugLog('按键/定位/获取', 'get word range', wordRange);
-        }
-        // 如果当前选中的词变化了, 才查新的词.
-        if (wordRange === null || lastWordRange && areRangesEqual(lastWordRange, wordRange)) return;
-
-        lastWordRange = wordRange
-        if (wordRange === null) return;
-        g_selection.removeAllRanges();
-        g_selection.addRange(wordRange);
-        debugLog('按键/定位/获取', 'current word range changed', lastWordRange)
-        queryWord(wordRange)
-
-
-    });
-
-    document.addEventListener('mouseup', (e) => {
-        if (g_card.exists && !g_card.cardElement.contains(e.target)) {
-            g_card.remove();
-            debugLog('按键', 'mouseup', 'event out card');
-            return;
-        }
-        if (!settings.enableMouseSelection) {
-            debugLog('按键', 'mouseup', 'mouse selection disabled');
         };
-        if (isInputTarget(e.target)) {
-            debugLog('按键', 'mouseup', 'event in input');
-            return;
-        }
-        if (g_card.exists && g_card.cardElement.contains(e.target)) {
-            debugLog('按键', 'mouseup', 'event in card')
-            return;
-        }
-        if (g_selection.rangeCount === 0) {
-            debugLog('按键', 'mouseup', 'no selection')
-            return;
+
+        setPosition(pos) {
+            const finalPos = this.computePosition(pos, this.CARD_WIDTH, this.CARD_HEIGHT);
+            this.cardElement.style.left = `${finalPos.left}px`;
+            this.cardElement.style.top = `${finalPos.top}px`;
         }
 
-        const wordRange = g_selection.getRangeAt(0)
-        if (wordRange.toString().trim() === "") return;
-        debugLog('按键/定位/获取', 'mouse up selection range', wordRange)
-        queryWord(wordRange);
-    });
+        bindEvents() {
+            // 关闭事件
+            this.closeHandle.addEventListener('click', () => this.destroy());
 
+            // 缩放逻辑
+            let isResizing = false;
+            this.resizeHandle.addEventListener('mousedown', (e) => {
+                e.preventDefault();
+                e.stopPropagation();
+                isResizing = true;
+            });
 
-    // ======== 工具函数 ========
-    function isInputTarget(target) {
-        const tag = target.tagName.toLowerCase();
-        return tag === 'input' || tag === 'textarea' || target.isContentEditable;
-    }
+            // 移动逻辑
+            let isMoving = false;
+            let offsetX = 0, offsetY = 0;
+            this.moveHandle.addEventListener('mousedown', (e) => {
+                e.preventDefault();
+                e.stopPropagation();
+                isMoving = true;
+                const rect = this.cardElement.getBoundingClientRect();
+                offsetX = e.clientX - rect.left;
+                offsetY = e.clientY - rect.top;
+            });
 
-    function isInputActive() {
-        const activeElement = document.activeElement;
-        const inputTypes = ['input', 'textarea', 'select', 'button', 'a'];
-
-        return (
-            activeElement &&
-            (inputTypes.includes(activeElement.tagName.toLowerCase()) ||
-             activeElement.isContentEditable)
-        );
-    }
-
-    function areRangesEqual(range1, range2) {
-        return (
-            range1.startContainer === range2.startContainer &&
-            range1.startOffset === range2.startOffset &&
-            range1.endContainer === range2.endContainer &&
-            range1.endOffset === range2.endOffset
-        );
-    }
-
-    function getRangeOffsetsInCommonAncestor(startContainer, startOffset, endContainer, endOffset, rootContainer) {
-        if (!rootContainer || !(rootContainer instanceof Node)) {
-            throw new Error('rootContainer 必须是 Node 对象');
-        }
-
-        let foundStart = false;
-        let foundEnd = false;
-        let charCount = 0;
-        let startCharOffset = null;
-        let endCharOffset = null;
-
-        // 递归遍历 rootContainer 下所有文本节点，累计字符长度
-        function traverse(node) {
-            if (foundEnd) return; // 都找到了就停止遍历
-
-            if (node.nodeType === Node.TEXT_NODE) {
-                if (!foundStart && node === startContainer) {
-                    startCharOffset = charCount + startOffset;
-                    foundStart = true;
+            // 全局鼠标事件
+            const handleMouseMove = (e) => {
+                if (isResizing) {
+                    const newWidth = e.clientX - this.cardElement.getBoundingClientRect().left;
+                    const newHeight = e.clientY - this.cardElement.getBoundingClientRect().top;
+                    this.container.style.width = Math.max(newWidth, 100) + 'px';
+                    this.container.style.height = Math.max(newHeight, 80) + 'px';
+                } else if (isMoving) {
+                    this.cardElement.style.left = (e.clientX - offsetX) + 'px';
+                    this.cardElement.style.top = (e.clientY - offsetY) + 'px';
                 }
-                if (!foundEnd && node === endContainer) {
-                    endCharOffset = charCount + endOffset;
-                    foundEnd = true;
-                }
-                charCount += node.textContent.length;
+            };
+
+            const handleMouseUp = () => {
+                isResizing = false;
+                isMoving = false;
+            };
+
+            document.addEventListener('mousemove', handleMouseMove);
+            document.addEventListener('mouseup', handleMouseUp);
+
+            // 保存引用以便后续移除
+            this._mouseMoveHandler = handleMouseMove;
+            this._mouseUpHandler = handleMouseUp;
+        }
+
+        display(info) {
+            if (info) {
+                this.renderContent(info);
+            }
+        }
+
+        renderContent(info) {
+            // 根据你的 info 结构来渲染内容
+            let contentHTML = '';
+
+            if (info.before || info.selectedWord || info.after) {
+                contentHTML = `
+                <div class="sentence">
+                    ${info.before || ''} 
+                    <span class="highlight">${info.selectedWord || ''}</span>
+                    ${info.after || ''}
+                </div>
+            `;
             } else {
-                for (let child of node.childNodes) {
-                    traverse(child);
-                    if (foundEnd) break;
-                }
+                contentHTML = '<p>No content available</p>';
             }
+
+            this.contentElement.innerHTML = contentHTML;
+
+            // 调试信息
+            this.debugElement.textContent = JSON.stringify(info, null, 2);
         }
 
-        traverse(rootContainer);
+        computePosition(pos, cardWidth, cardHeight) {
+            const viewportWidth = window.innerWidth;
+            const viewportHeight = window.innerHeight;
 
-        if (startCharOffset === null || endCharOffset === null) {
-            throw new Error('未能在公共祖先节点内找到 Range 的起止容器');
+            const candidates = [
+                { left: pos.bottom_right.x, top: pos.bottom_right.y },
+                { left: pos.top_right.x, top: pos.top_right.y - cardHeight },
+                { left: pos.bottom_left.x - cardWidth, top: pos.bottom_left.y },
+                { left: pos.top_left.x - cardWidth, top: pos.top_left.y - cardHeight }
+            ];
+
+            return candidates.find(c =>
+                c.left >= 0 &&
+                c.top >= 0 &&
+                c.left + cardWidth <= viewportWidth &&
+                c.top + cardHeight <= viewportHeight
+            ) || candidates[0];
         }
 
-        return {
-            containerNode: rootContainer,
-            startOffset: startCharOffset,
-            endOffset: endCharOffset,
-        };
+        isPointInCard(x, y) {
+            const rect = this.cardElement.getBoundingClientRect();
+            return (
+                x >= rect.left &&
+                x <= rect.right &&
+                y >= rect.top &&
+                y <= rect.bottom
+            );
+        }
+
+        isMouseInCard(target) {
+            return this.cardElement.contains(target) ||
+                this.cardElement.shadowRoot.contains(target);
+        }
+
+        destroy() {
+            // 移除全局事件监听器
+            if (this._mouseMoveHandler) {
+                document.removeEventListener('mousemove', this._mouseMoveHandler);
+            }
+            if (this._mouseUpHandler) {
+                document.removeEventListener('mouseup', this._mouseUpHandler);
+            }
+
+            // 移除DOM元素
+            if (this.cardElement && this.cardElement.parentNode) {
+                this.cardElement.parentNode.removeChild(this.cardElement);
+            }
+
+            this.exists = false;
+        }
     }
 
-    // 选择单词
-    // 返回range
-    function getWordRangeFromCaret(caret) {
-        if (!caret) return null;
-
-        let node = caret.offsetNode;
-        let offset = caret.offset;
-
-        // 如果不是文本节点，尝试找第一个文本节点
-        if (node.nodeType !== Node.TEXT_NODE) {
-            let walker = document.createTreeWalker(node, NodeFilter.SHOW_TEXT, null);
-            node = walker.nextNode();
-            if (!node) return null;
-            offset = 0;
+    class CardManager {
+        constructor() {
+            this.card = null;
         }
 
-        const text = node.textContent;
-        if (!text) return null;
+        cardExists() {
+            return this.card !== null && this.card.exists;
+        }
+        isPointInCard(x, y) {
+            return this.cardExists() && this.card.isPointInCard(x, y);
+        }
+        isMouseInCard(target) {
+            return this.cardExists() && this.card.isMouseInCard(target);
+        }
 
-        // 匹配字符规则：字母、数字、下划线、横杠
-        const isWordChar = (ch) => /[A-Za-z0-9_-]/.test(ch);
-
-        // 找左边界
-        let start = offset;
-        while (start > 0 && isWordChar(text[start - 1])) start--;
-
-        // 找右边界
-        let end = offset;
-        while (end < text.length && isWordChar(text[end])) end++;
-
-        // 避免单词开头或结尾出现横杠
-        while (start < end && text[start] === '-') start++;
-        while (end > start && text[end - 1] === '-') end--;
-
-        if (start >= end) return null; // 没有有效单词
-
-        // 创建 range
-        const range = document.createRange();
-        range.setStart(node, start);
-        range.setEnd(node, end);
-
-        return range;
+        createCard(pos, info) {
+            if (this.cardExists()) this.removeCard()
+            this.card = new WordCard(pos, info)
+        }
+        removeCard() {
+            if (this.cardExists()) {
+                this.card.destroy()
+                this.card = null
+            }
+        }
     }
 
-    // ======== web 工具类 ========
-    const WebUtils = {
-        /**
-         * 查询词典 API
-         * @param {string} word 要查询的单词
-         * @param {string} dictName 词典类型 (默认 'collins')
-         * @param {number} timeout 超时时间 (默认 3000ms)
-         * @returns {Promise<string>} 返回原始字符串数据
-         */
-        fetchDict: async function(word, dictName = 'COBUILD', timeout = 3000) {
-            const url = `http://127.0.0.1:5000/query?dict=${encodeURIComponent(dictName)}&q=${encodeURIComponent(word)}`;
-            try {
-                const controller = new AbortController();
-                const timeoutId = setTimeout(() => controller.abort(), timeout);
-                const response = await fetch(url, {
-                    signal: controller.signal,
-                    headers: { 'Accept': 'text/plain' }
-                });
-                clearTimeout(timeoutId);
-                if (!response.ok) {
-                    throw new Error(`HTTP error! status: ${response.status}`);
+    class EventManager {
+        // ======== 事件监听 ========
+        constructor(
+            getSetting,
+            cardExists,
+            isPointInCard,
+            isMouseInCard,
+            removeCard,
+            queryFromPoint,
+            queryFromSelection,
+            resetLastSelection,
+        ) {
+            this.getSetting = getSetting;
+            this.cardExists = cardExists;
+            this.isPointInCard = isPointInCard;
+            this.isMouseInCard = isMouseInCard;
+            this.removeCard = removeCard;
+            this.queryFromPoint = queryFromPoint;
+            this.queryFromSelection = queryFromSelection;
+            this.resetLastSelection = resetLastSelection;
+            this.hotkeyPressed = false;
+            this.lastWordRange = null;
+            this.mousePos = { x: 0, y: 0 }
+            this.lastMouseLogTime = 0;
+            this.mouseLogInterval = 1000; // 1秒
+        }
+
+        bindEvents() {
+
+            Utils.debug_log("[event manager] [init]")
+
+            /**
+             * 按下热键:
+             *  - 设置按下状态为true
+             */
+            document.addEventListener('keydown', (e) => {
+                if (Utils.isTargetInInput(e.target) ||
+                    e.key !== this.getSetting('hotkey') ||
+                    this.hotkeyPressed
+                ) return;
+                Utils.debug_log(`[Event manager] [keydown] key '${e.key}' pressed.`)
+                this.hotkeyPressed = true;
+            });
+
+            /**
+             * 松开热键:
+             *  - 设置按下状态为false
+             *  - 从鼠标处触发query from point
+             */
+            document.addEventListener('keyup', (e) => {
+                if (Utils.isTargetInInput(e.target) ||
+                    e.key !== this.getSetting('hotkey')
+                ) return;
+                this.hotkeyPressed = false;
+                // 如果点击在卡片内部, 就不触发.
+                if (this.isPointInCard(this.mousePos.x, this.mousePos.y)) return;
+
+                Utils.debug_log(`[Event manager] [keyup] key '${e.key} released.`)
+                this.queryFromPoint(this.mousePos.x, this.mousePos.y)
+                this.resetLastSelection();
+            });
+
+            /**
+             * 鼠标移动:
+             *  - 悬浮选词
+             */
+            document.addEventListener('mousemove', (e) => {
+                this.mousePos = { x: e.clientX, y: e.clientY };
+                if (!this.getSetting('enableHoverSelection') || // 未开启悬停选词设置
+                    !this.hotkeyPressed ||                      // 未按住快捷键
+                    Utils.isTargetInInput(e.target) ||            // 目标在输入框里
+                    this.isMouseInCard(e.target)                // 目标在卡片里
+                ) return;
+
+                // 节流输出日志
+                const currentTime = Date.now();
+                if (currentTime - this.lastMouseLogTime >= this.mouseLogInterval) {
+                    Utils.debug_log(`[Event manager] [mousemove] mouse moving at (${this.mousePos.x}, ${this.mousePos.y})`);
+                    this.lastMouseLogTime = currentTime;
                 }
-                return await response.text();
-            } catch (error) {
-                console.error('[Dict Fetch Error]', error);
-                return Promise.reject(`查询失败: ${error.message || '未知错误'}`);
-            }
-        },
+
+                this.queryFromPoint(this.mousePos.x, this.mousePos.y)
+            });
+
+            /**
+             * 鼠标松开:
+             *  - 移除卡片
+             *  - 获得选区
+             */
+            document.addEventListener('mouseup', (e) => {
+                if (this.cardExists() && !this.isMouseInCard(e.target)) this.removeCard()
+
+                if (!this.getSetting('enableMouseSelection') ||
+                    Utils.isTargetInInput(e.target) ||
+                    this.isMouseInCard(e.target)
+                ) return;
+
+                Utils.debug_log(`[Event manager] [mouseup] mouse released at (${this.mousePos.x}, ${this.mousePos.y})`);
+                this.queryFromSelection();
+            });
+        }
+
     }
-    // ======== GM 菜单开关 ========
-
-    function registerMenus() {
-        GM_registerMenuCommand(`启用 Debug Mode: ${settings.enableDebugMode ? '✅' : '❌'}`, () => {
-            settings.enableDebugMode = !settings.enableDebugMode;
-            saveSettings();
-            registerMenus();
-        }, {
-            id: 'enable-debug-mode',
-        });
-
-        GM_registerMenuCommand(`启用 鼠标选择: ${settings.enableMouseSelection ? '✅' : '❌'}`, () => {
-            settings.enableMouseSelection = !settings.enableMouseSelection;
-            saveSettings();
-            registerMenus();
-        }, {
-            id: 'enable-mouse-selection',
-        });
-
-        GM_registerMenuCommand(`启用 悬浮选择: ${settings.enableHoverSelection ? '✅' : '❌'}`, () => {
-            settings.enableHoverSelection = !settings.enableHoverSelection;
-            saveSettings();
-            registerMenus();
-        }, {
-            id: 'enable-hover-selection',
-        });
-
-        GM_registerMenuCommand(`设置快捷键 (当前: ${settings.hotkey})`, () => {
-            const key = prompt('请输入快捷键名称（例如 Control / Alt / Shift / F2）', settings.hotkey);
-            if (key) {
-                settings.hotkey = key;
-                saveSettings();
-                registerMenus();
+    class Utils {
+        static isDebugEnabled = null;
+        static init(isDebugEnabled) {
+            this.isDebugEnabled = isDebugEnabled;
+        }
+        static debug_log(msg) {
+            if (this.isDebugEnabled()) {
+                console.log(`Collex Debug > ${msg}`);
             }
-        }, {
-            id: 'set-hotkey',
-        });
-        debugLog('初始化', "update GM menu settings", settings)
-    }
+        }
+        static isTargetInInput(target) {
+            const tag = target.tagName.toLowerCase();
+            return tag === 'input' || tag === 'textarea' || target.isContentEditable;
+        }
+        static isInputActive() {
+            const activeElement = document.activeElement;
+            const inputTypes = ['input', 'textarea', 'select', 'button', 'a'];
 
-    // ======== 查词页面 ========
-    function queryWord(range) {
-        // { containerNode, startOffset, endOffset }
-        const wordRange = getRangeOffsetsInCommonAncestor(
-            range.startContainer, range.startOffset,
-            range.endContainer, range.endOffset,
-            range.commonAncestorContainer);
-
-        const fullText = wordRange.containerNode.textContent; // 或 textNode.nodeValue
-        const selectedWord = fullText.slice(wordRange.startOffset, wordRange.endOffset);
-        debugLog('按键/定位/获取', 'selected text:', selectedWord);
-
-        // ==== 查找的单词所在句子 ====
-        const {before, after} = extractSentence(wordRange.containerNode, wordRange.startOffset, wordRange.endOffset);
-        debugLog('按键/定位/获取/处理',
-                 'Extract sentence',
-                 `\n[before] "${before}"`,
-                 `\n[word]   "${selectedWord}"`,
-                 `\n[after]  "${after}"`);
-
-        // ==== 唤起查词页面 ====
-        g_card.create({before, word: selectedWord, after})
-    }
-
-    function extractSentence(containerNode, startOffset, endOffset) {
-        const sentenceBoundary = /([.!?])(?=\s+["'“”]?[A-Z]|$)/;
-
-        function getFirstTextNode(el) {
-            if (el.nodeType === Node.TEXT_NODE) return el;
-            for (let child of el.childNodes) {
-                let found = getFirstTextNode(child);
-                if (found) return found;
-            }
-            return null;
+            return (
+                activeElement &&
+                (inputTypes.includes(activeElement.tagName.toLowerCase()) ||
+                    activeElement.isContentEditable)
+            );
+        }
+        static collectContext() {
+            return {
+                url: location.href,
+                title: document.title,
+                domain: location.hostname,
+                favicon: document.querySelector('link[rel~="icon"]')?.href || '',
+                author: document.querySelector('meta[name="author"]')?.content || '',
+                siteName: document.querySelector('meta[property="og:site_name"]')?.content || '',
+                publicationDate: document.querySelector('meta[name="date"], meta[property="article:published_time"]')?.content || '',
+            };
         }
 
-        function getLastTextNode(el) {
-            if (el.nodeType === Node.TEXT_NODE) return el;
-            for (let i = el.childNodes.length - 1; i >= 0; i--) {
-                let found = getLastTextNode(el.childNodes[i]);
-                if (found) return found;
-            }
-            return null;
-        }
-
-        function collectBackward(node, offset) {
-            let text = node.textContent.slice(0, offset);
-            let current = node;
-
-            while (true) {
-                debugLog('按键/定位/获取/处理', 
-                    '[collect backward] 当前节点:', current, '当前文本:', JSON.stringify(text));
-
-                if (sentenceBoundary.test(text)) {
-                    debugLog('按键/定位/获取/处理', '[collect backward] 命中句子边界，停止');
-                    break;
-                }
-
-                if (!current.previousSibling) {
-                    // 如果当前节点是行内元素的子节点，则跳到父节点继续向上找
-                    if (
-                        current.parentNode &&
-                        current.parentNode.nodeType === Node.ELEMENT_NODE &&
-                        window.getComputedStyle(current.parentNode).display === 'inline'
-                    ) {
-                        current = current.parentNode;
-                        continue; // 再次尝试 previousSibling
-                    }
-                    break; // 块级元素或到根节点，停止
-                }
-
-                current = current.previousSibling;
-
-                if (current.nodeType === Node.TEXT_NODE) {
-                    text = current.textContent + text;
-                } else if (current.nodeType === Node.ELEMENT_NODE) {
-                    if (window.getComputedStyle(current).display === 'block') break;
-                    let lastText = getLastTextNode(current);
-                    if (lastText) {
-                        text = lastText.textContent + text;
-                    }
-                }
-            }
-
-            return text;
-        }
-
-        function collectForward(node, offset) {
-            let text = node.textContent.slice(offset);
-            let current = node;
-
-            while (true) {
-                debugLog('按键/定位/获取/处理', '[collect forward] 当前节点:', current, '当前拼接文本:', JSON.stringify(text));
-
-                if (sentenceBoundary.test(text)) {
-                    debugLog('按键/定位/获取/处理', '[collect forward] 命中句子边界，停止');
-                    break;
-                }
-
-                if (!current.nextSibling) {
-                    // 如果父节点是行内元素，则跳到父节点继续向后找
-                    if (
-                        current.parentNode &&
-                        current.parentNode.nodeType === Node.ELEMENT_NODE &&
-                        window.getComputedStyle(current.parentNode).display === 'inline'
-                    ) {
-                        current = current.parentNode;
-                        continue; // 再次尝试 nextSibling
-                    } else {
-                        break; // 块级元素或到根节点，停止
-                    }
-                }
-
-                current = current.nextSibling;
-
-                if (current.nodeType === Node.TEXT_NODE) {
-                    text += current.textContent;
-                } else if (current.nodeType === Node.ELEMENT_NODE) {
-                    if (window.getComputedStyle(current).display === "block") break;
-                    const firstText = getFirstTextNode(current);
-                    if (firstText) {
-                        text += firstText.textContent;
-                    }
-                }
-            }
-            return text;
-        }
-
-
-        let before = collectBackward(containerNode, startOffset);
-        let after = collectForward(containerNode, endOffset);
-        // 将换行符替换为空格
-        before = before.replace(/\n/g, ' ');
-        after = after.replace(/\n/g, ' ');
-        debugLog('按键/定位/获取/处理', 'Extract context',
-                 `\n[before] "${before}"`,
-                 `\n[word]   "${containerNode.textContent.slice(startOffset, endOffset)}"`,
-                 `\n[after]  "${after}"`);
-
-        // 这段真是完美的代码啊.
-        // 打脸了.
-        before = before.trim()
-        after = after.trim()
-        let sentenceStartIdx = 0;
-        let relativeStartIdx = 0;
-        while (relativeStartIdx !== -1) {
-            relativeStartIdx = before.slice(sentenceStartIdx).search(sentenceBoundary)
-            sentenceStartIdx = sentenceStartIdx + relativeStartIdx + 1
-        }
-
-        let sentenceEndIdx = after.length;
-        const relativeEndIdx = after.search(sentenceBoundary);
-        if (relativeEndIdx !== -1) sentenceEndIdx = relativeEndIdx + 1;
-
-        return {
-            before: before.slice(sentenceStartIdx, before.length).trim(),
-            after: after.slice(0, sentenceEndIdx).trim()
-        };
     }
 
-
-
-    registerMenus();
+    let app = new CollexApp()
 })();
- 
