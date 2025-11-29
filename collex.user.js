@@ -1,11 +1,15 @@
 // ==UserScript==
 // @name         采词
-// @version      0.8
+// @version      1.0
 // @description  可以在阅读中学习单词.
 // @match        *://*/*
 // @grant        GM_getValue
 // @grant        GM_setValue
 // @grant        GM_registerMenuCommand
+// @grant        GM_xmlhttpRequest
+// @connect      api.deepseek.com
+// @connect      127.0.0.1
+// @connect      localhost
 // ==/UserScript==
 
 
@@ -41,25 +45,19 @@
  *  25/11/03  v0.9    懒得继续重构了. 重构完, 写了一天, 没bug了, 所以继续写新功能了.
  *                    新功能将会暂时很简单. 释义直接问ai, 然后直接投入到anki的连接里面.
  *                    还需要重新写一下展示卡片位置的事情. 直接传入rects吧.
+ *  25/11/29  v1.0    正式发布1.0版本.
+ *                    修改了查词的prompt
+ *                    修改了anki卡片模板 (现在是使用 collex 2)
+ *                    修改了卡片出现位置逻辑
 
 任务
-1. [功能]完成与后端的连接
-2. [功能]编写中间件
-3. [功能]渲染前端: 可以交给AI(似乎可以做一下多词典的布局.)
-4. [功能]与anki连接
-    4.1 需要连接anki的http接口, 并写一个持续的检测是否在线
-    4.2 需要写好与anki的字段的对应
-    4.3 需要在浏览器上再采集一些信息(url, 网页title, 甚至截图)
-5. [优化]拆分选停选词和按键选词在监听事件中的逻辑
-6. [优化]重写Utils.debug_log, 一方面更规范化方便调试时的filter, 一方面给debug分级.
-5. [优化]调整卡片出现的位置
-    5.1 出现位置由鼠标决定修改为选区的四个角座标决定
-    5.2 默认右下角, 如果下方没有位置出现在右上角, 右方没有位置出现在左上角, 都没有位置仍然右下角.
-5. [优化](没什么jb用)给卡片的三个小方块加一点点特效, 鼠标悬浮时, 红方块颜色变深, 蓝方块移动, 黄方块改变形状
-6. [优化]写一个langchain, 可以查单词的词源或例句, 还可以根据单词出现的句子来直接推断是哪个释义, 直接放在最前面! 可以和mdict联动, 包裹起来.
-   也许可以放在中间件, 因为我觉得可以复用词典的中间件, json化的数据似乎更适合AI处理...
-7. [优化]以后再说啦, 改写成浏览器的插件, 火狐和chrome.
-8. [优化]也许总有无法提取出句子的时候, 可以加一个手动模式, 复制单词, 句子, 甚至截图.
+
+- [优化] 将项目优化成更适合初见的样子, 变得一键可运行.
+- [优化] 也许可以增加在卡片上编辑原句的功能, 可以修改pre和post, 至少可以增加.
+- [优化] 支持chrome和firefox的扩展/插件.
+- [优化] 编写其他的查词来源(除了当前的deepseek)
+- [功能] 支持用户自定义查词来源函数.
+- [优化] 增加一个手动模式, 复制单词, 句子, 甚至截图, 以应对无法提取出句子的时候.
 
  */
 
@@ -109,20 +107,25 @@
 
         async queryWord(range) {
             Utils.debug_log('[app] [query range]' + range.toString())
+            const pos = this.rangeManager.getSelectionCorners()
+
             let info = {
                 pre: null,
                 word: null,
                 post: null,
+                dict_promise: null,
+                lemma: null,
+                reading: null,
+                lables: null,
                 meaning: null,
+                meaning_chinese: null,
                 url: null,
                 title: null,
                 favicon: null,
             };
             Object.assign(info, this.rangeManager.extractContext(range))
-            Utils.debug_log("[app] [info]" + JSON.stringify(info))
             Object.assign(info, Utils.collectContext())
-            info.meaning = this.dictManager.query(info)
-            const pos = this.rangeManager.getRangeCorners()
+            info.dict_promise = this.dictManager.dict_ai(info)
             this.cardManager.createCard(pos, info)
         }
     };
@@ -130,7 +133,7 @@
      * 词典管理
      */
     class DictManager {
-        async query(context) {
+        query(context) {
             /* context = {
                 pre: null,
                 word: null,
@@ -140,87 +143,141 @@
                 favicon: null,
             };
             */
-            // "meaning xxx"
+            // {meaning_promise, metainfo_promise}"
             return this.dict_ai(context);
         }
-
-        async dict_ai(context) {
-            const DEEPSEEK_API_KEY = ""; // 请替换为你的API密钥
-            const DEEPSEEK_API_URL = "https://api.deepseek.com/chat/completions"; // DeepSeek API端点
-
+        dict_ai(context) {
             try {
-                // 构建完整的句子
-                const fullSentence = `${context.pre || ''} [ ${context.word} ] ${context.post || ''}`.trim();
+                // 拼接语境句子
+                const fullSentence = `${context.pre || ''} ${context.word} ${context.post || ''}`.trim();
 
-                // 构建提示词，明确要求单词解释
-                let prompt = `"${fullSentence}"\n请解释上面句子中"${context.word}"这个词的含义\n`;
-                // 可选：添加辅助信息（根据实验效果决定是否使用）
-                const additionalInfo = [];
-                if (context.title) additionalInfo.push(`标题: ${context.title}`);
+                // 构造 prompt（使用你确认过的版本）
+                const prompt = `
+你是一名专业的英语词典编纂者，需要根据用户提供的单词与语境，返回一个结构化的 JSON，包含单词在该语境中的实际释义、原型、读音、词性与语域标签等信息。
 
-                if (additionalInfo.length > 0) {
-                    prompt += `\n\n辅助信息:\n${additionalInfo.join('\n')}`;
-                }
+用户会给出：
+- 单词 word  
+- 语境句子：由 pre + word + post 拼成  
+- 可选：网页标题 title  
 
-                const requestBody = {
-                    model: "deepseek-chat", // 根据可用的模型调整
-                    messages: [
-                        {
-                            role: "system",
-                            content: `
-你是一个专业的语言教师，专注于提供单词在具体语境中的准确解释。
-用户的英语水平是中高级学习者, 了解常见的语言知识.
-如果用户询问的phrase是一个单词或者很常用的固定搭配, 就请首先, 
-在这个单词的所有的通用解释(就是和语境无关, 会在词典中看到的那样)中选择那个当前语境使用了的那个释义,
-并用英语提供, 使用vocabulary.com风格;
-然后再结合语境(意思不是解释语境这句话, 而是说你给的词要蕴含着语境的信息, 这要求你选择最恰当的那个词), 用中文, 只用一个词来解释用户询问的东西.
-else, 如果用户提供的phrase是一个句子, 或者不完整的句子, 并不是固定搭配, 就请简单提供它的中文翻译.
-如果用户提交的phrase涉及到的单词非常简单, 那么他也许是不明白其中涉及到的概念, 请你解释一下.
-我希望输出结果不要带有markdown标点. `
-                        },
-                        {
-                            role: "user",
-                            content: prompt
-                        }
-                    ],
-                    max_tokens: 500,
-                    stream: false,
-                    temperature: 0.5 // 较低的温度以获得更确定的回答
-                };
+你的任务是根据语境推断该单词在句子中的含义，并按以下 JSON 格式输出：
 
-                const response = await fetch(DEEPSEEK_API_URL, {
-                    method: "POST",
-                    headers: {
-                        "Content-Type": "application/json",
-                        "Authorization": `Bearer ${DEEPSEEK_API_KEY}`
-                    },
-                    body: JSON.stringify(requestBody)
-                });
+{
+  "lemma": "...",
+  "reading": "...",
+  "labels": ["...", "...", "..."],
+  "meaning": "...",
+  "meaning_chinese": "..."
+}
 
-                if (!response.ok) {
-                    throw new Error(`API请求失败: ${response.status} ${response.statusText}`);
-                }
+字段要求如下：
 
-                const data = await response.json();
+- lemma：单词的原型（如 reflected → reflect，memories → memory）
+- reading：该词最常见的 IPA 音标，使用国际音标格式，例如 "/rɪˈflekt/"
+- labels：数组形式，依次包含：
+    1. 词性标签（如 "v.", "n.", "adj."）
+    2. 语域标签（formal / informal / slang / literary / technical 等，若无可省略）
+    3. 语法标签（如 [T], [I], [C], [U]）
+- meaning：英文释义，用 vocabulary.com 风格，通俗、自然
+- meaning_chinese：中文释义，简洁，一两个词即可
 
-                // 提取回答内容
-                const meaning = data.choices[0]?.message?.content?.trim();
+请只返回 JSON，不要返回额外解释。
 
-                if (!meaning) {
-                    throw new Error("未能获取有效的解释");
-                }
+用户输入：
+单词：${context.word}
+句子："${fullSentence}"
+网页标题：${context.title || '（无）'}
+        `;
 
-                Utils.debug_log(`[dict manager] [ask ai] deepseek: ${meaning}`)
+                // 发送一次请求
+                const messages = [
+                    { role: "system", content: "你是一名专业英语词典编纂者。" },
+                    { role: "user", content: prompt }
+                ];
 
-                return meaning;
+                const json_promise = Utils.askAI("deepseek-chat", messages, { max_tokens: 500 });
+
+                return json_promise;
 
             } catch (error) {
-                Utils.debug_log("[dict manager] [fetch] 调用DeepSeek API时出错:" + error);
-
-                // 降级方案：返回基本解释或错误信息
-                return `无法获取"${context.word}"的解释。错误: ${error.message}`
+                Utils.debug_log("[dict manager] 调用dict_ai出错:" + error);
+                return `无法获取"${context.word}"的信息。错误: ${error.message}`
             }
         }
+
+        //         dict_ai(context) {
+        //             try {
+        //                 const fullSentence = `${context.pre || ''} [ ${context.word} ] ${context.post || ''}`.trim();
+
+        //                 // 1️⃣ 第一次请求：语义解释
+        //                 let explainPrompt = `"${fullSentence}"\n请解释上面句子中"${context.word}"这个词的含义。\n`;
+        //                 if (context.title) explainPrompt += `\n\n网页标题为: ${context.title}`
+
+        //                 const explainMessages = [
+        //                     {
+        //                         role: "system",
+        //                         content: `
+        // 你是一个专业的语言教师，专注于提供单词在具体语境中的准确解释。
+        // 请解释用户向你查询的单词. 用户会提供他遇到这个单词时的语境, 你提供的单词释义应当是语境中出现时的那个释义.
+        // 请先提供英语的解释
+        // 再提供中文的解释. 
+        // 其中, 英文的解释我想要vocabulary.com风格的. 中文的解释简洁一些就好, 要像词汇书中用一两个词语来解释, 而不是像对话一样说很多.
+        // 我希望输出结果不要带有markdown记号, 而是用<div>包裹, 并且其中每一个段落都用<p>包裹, 并且不要有任何样式. 
+
+        // `
+        //                     },
+        //                     { role: "user", content: explainPrompt }
+        //                 ];
+
+        //                 const meaning_promise = Utils.askAI("deepseek-chat", explainMessages, { max_tokens: 500 });
+
+        //                 // 2️⃣ 第二次请求：词性、语域、语法标签分析
+        //                 const metaPrompt = `
+        // 请分析以下单词:
+        // "${context.word}" (出现在句子: "${fullSentence}")
+
+        // 请提供:
+        // - 原型 (lemma), 比如annoying, 如果在语境中是形容词就提供给我annoying, 如果是动词就提供给我annoy
+        // - 词性标签 (POS)
+        // - 语域或文体标签 (register/style): formal, informal, slang, literary, archaic, technical...
+        // - 语法标签 (grammar): [T], [I], [U], [C] (表示动词是否及物, 名词是否可数等)
+
+        // 示例格式:
+        // abide v. formal
+        // kiddo n. informal
+        // reckon v. chiefly British, informal
+        // thus adv. formal, literary
+        // ...
+
+        // 请使用如下HTML结构输出（无样式）:
+        // <div class="dict-meta">
+        //   <div class="word">${context.word}</div>
+        //   <div class="tags-container">
+        //     <span class="meta-label pos-label ">v.</span>
+        //     <span class="meta-label register-label ">informal</span> 
+        //     <span class="meta-label grammar-label ">[T]</span> 
+        //   </div>
+        // </div>
+        //         `;
+
+        //                 const metaMessages = [
+        //                     { role: "system", content: "你是一个英语语言学专家，专注于词性与语域分析。" },
+        //                     { role: "user", content: metaPrompt }
+        //                 ];
+
+        //                 const metainfo_promise = Utils.askAI("deepseek-chat", metaMessages, { max_tokens: 300 });
+
+        //                 return { meaning_promise, metainfo_promise };
+
+        //             } catch (error) {
+        //                 Utils.debug_log("[dict manager] 调用dict_ai出错:" + error);
+        //                 return {
+        //                     meaning_promise: `无法获取"${context.word}"的解释。错误: ${error.message}`,
+        //                     metainfo_promise: ""
+        //                 };
+        //             }
+        //         }
+
         /**
          * 查询词典 API
          * @param {string} word 要查询的单词
@@ -342,7 +399,7 @@ else, 如果用户提供的phrase是一个句子, 或者不完整的句子, 并�
             this.selection = window.getSelection();
             this.lastRangeFromPoint = null;
         }
-        getRangeCorners() {
+        getSelectionCorners() {
             const rects = this.selection.getRangeAt(0).getClientRects();
             const firstRect = rects[0];
             const lastRect = rects[rects.length - 1];
@@ -748,9 +805,9 @@ else, 如果用户提供的phrase是一个句子, 或者不完整的句子, 并�
             container.style.boxSizing = 'content-box';
             shadow.appendChild(container);
 
-            const contentP = document.createElement('p');
-            contentP.innerText = "content"
-            container.appendChild(contentP)
+            // const contentP = document.createElement('p');
+            // contentP.innerText = "content"
+            // container.appendChild(contentP)
 
             const contentDiv = document.createElement('div');
             contentDiv.id = 'content-div'
@@ -886,59 +943,102 @@ else, 如果用户提供的phrase是一个句子, 或者不完整的句子, 并�
         }
 
         async renderContent(info) {
+            function cleanJson(raw) {
+                if (typeof raw !== "string") return raw;
 
-            info.meaning = await info.meaning;
+                // 去掉 ```json 和 ```（包括可能有的空格）
+                return raw
+                    .replace(/```json\s*/i, "")
+                    .replace(/```/g, "")
+                    .trim();
+            }
+            const res = await info.dict_promise;
+            const data = JSON.parse(cleanJson(res))
+
+            Utils.debug_log('[render parse]', data)
+
+            info.lemma = data.lemma;
+            info.reading = data.reading;
+            info.labels = data.labels;
+            info.meaning = data.meaning;
+            info.meaning_chinese = data.meaning_chinese;
+
+            Utils.debug_log("[card manager] [info]", info)
             let contentHTML = '';
 
-            // 标题区域（如果有标题信息）
-            if (info.title || info.siteName) {
+            // ======= 基础词汇信息（lemma / reading / labels） =======
+            if (info.lemma || info.reading || info.labels) {
                 contentHTML += `
-                <div style="margin-bottom: 16px; border-bottom: 1px solid #eee; padding-bottom: 12px;">
-                    ${info.title ? `<div style="font-weight: bold; font-size: 16px; margin-bottom: 4px;">${this.escapeHtml(info.title)}</div>` : ''}
-                    ${info.siteName ? `<div style="font-size: 12px; color: #666;">${this.escapeHtml(info.siteName)}</div>` : ''}
-                </div>
-            `;
-            }
-
-            // 核心词汇信息
-            contentHTML += `
-            <div style="margin-bottom: 16px;">
-                ${info.pre ? `<span style="color: #666;">${this.escapeHtml(info.pre)}</span>` : ''}
-                <span style="font-weight: bold; color: #007cba; background: #f0f8ff; padding: 2px 4px; border-radius: 3px;">${this.escapeHtml(info.word || '')}</span>
-                ${info.post ? `<span style="color: #666;">${this.escapeHtml(info.post)}</span>` : ''}
-            </div>
-        `;
-
-            // 词义解释
-            if (info.meaning) {
-                contentHTML += `
-                <div style="margin-bottom: 16px;">
-                    <div style="font-weight: bold; margin-bottom: 8px; color: #333;">释义</div>
-                    <div style="color: #555; line-height: 1.5;">${this.escapeHtml(info.meaning)}</div>
-                </div>
-            `;
-            }
-
-            // 如果没有核心内容，显示提示
-            if (!info.word && !info.meaning) {
-                contentHTML = `
-                <div style="display: flex; justify-content: center; align-items: center; height: 100%; color: #666;">
-                    <div style="text-align: center;">
-                        <div>暂无可用信息</div>
+                    <div style="margin-bottom: 16px;">
+                        <div style="font-weight: bold; margin-bottom: 8px; color: #333;">词汇信息</div>
+                        <div class="meta-section" style="color: #444; line-height: 1.6;">
+                            ${info.lemma ? `<div><strong>原型：</strong>${this.escapeHtml(info.lemma)}</div>` : ""}
+                            ${info.reading ? `<div><strong>读音：</strong>${this.escapeHtml(info.reading)}</div>` : ""}
+                            ${info.labels ? `<div><strong>标签：</strong>${this.escapeHtml(info.labels)}</div>` : ""}
+                        </div>
                     </div>
+                `;
+            }
+
+            // ======= 释义（英文 / 中文） =======
+            if (info.meaning || info.meaning_chinese) {
+                contentHTML += `
+                    <div style="margin-bottom: 16px;">
+                        <div style="font-weight: bold; margin-bottom: 8px; color: #333;">释义</div>
+                        ${info.meaning ? `<div style="color: #555; margin-bottom: 6px;">${this.escapeHtml(info.meaning)}</div>` : ""}
+                        ${info.meaning_chinese ? `<div style="color: #777;">${this.escapeHtml(info.meaning_chinese)}</div>` : ""}
+                    </div>
+                `;
+            }
+
+            // ======= 原句区 =======
+            contentHTML += `
+                <div style="margin-bottom: 16px;">
+                    <div style="font-weight: bold; margin-bottom: 8px; color: #333;">原句</div>
+                    ${info.pre ? `<span style="color: #666;">${this.escapeHtml(info.pre)}</span>` : ""}
+                    <span style="font-weight: bold; color: #007cba; background: #f0f8ff; padding: 2px 4px; border-radius: 3px;">
+                        ${this.escapeHtml(info.word || "")}
+                    </span>
+                    ${info.post ? `<span style="color: #666;">${this.escapeHtml(info.post)}</span>` : ""}
                 </div>
             `;
+
+            // ======= 网页信息（title + url + favicon） =======
+            if (info.title || info.url || info.favicon) {
+                contentHTML += `
+                    <div style="margin-bottom: 16px; border-bottom: 1px solid #eee; padding-bottom: 12px;">
+                        <div style="font-weight: bold; margin-bottom: 8px; color: #333;">来源页面</div>
+
+                        ${info.favicon ? `<img src="${this.escapeHtml(info.favicon)}" style="width:16px; height:16px; margin-right:6px;">` : ""}
+                        ${info.title ? `<span style="font-weight: bold; font-size: 15px;">${this.escapeHtml(info.title)}</span>` : ""}
+
+                        ${info.url ? `<div style="font-size: 12px; color: #007cba; margin-top: 4px;">${this.escapeHtml(info.url)}</div>` : ""}
+                    </div>
+                `;
             }
+
+            // ======= 没内容时的兜底 =======
+            if (!info.word && !info.meaning && !info.lemma) {
+                contentHTML = `
+                    <div style="display: flex; justify-content: center; align-items: center; height: 100%; color: #666;">
+                        <div style="text-align: center;">
+                            <div>暂无可用信息</div>
+                        </div>
+                    </div>
+                `;
+            }
+
+
             contentHTML += `
-    <div style="margin-top: 20px; text-align: center;">
-        <button id="add-to-anki-btn"
-            style="background-color: #007cba; color: white; border: none;
-                   padding: 8px 16px; border-radius: 5px; cursor: pointer;
-                   transition: background-color 0.3s;">
-            添加到 Anki
-        </button>
-    </div>
-`;
+                <div style="margin-top: 20px; text-align: center;">
+                    <button id="add-to-anki-btn"
+                        style="background-color: #007cba; color: white; border: none;
+                            padding: 8px 16px; border-radius: 5px; cursor: pointer;
+                            transition: background-color 0.3s;">
+                        添加到 Anki
+                    </button>
+                </div>
+            `;
             this.contentElement.innerHTML = contentHTML;
 
 
@@ -953,25 +1053,38 @@ else, 如果用户提供的phrase是一个句子, 或者不完整的句子, 并�
                     }
                 };
 
-                // 尝试发送请求到 AnkiConnect
-                fetch("http://127.0.0.1:8765", {
+                GM_xmlhttpRequest({
                     method: "POST",
+                    url: "http://127.0.0.1:8765",
                     headers: { "Content-Type": "application/json" },
-                    body: JSON.stringify(browsePayload)
-                })
-                    .then(response => response.json())
-                    .then(result => {
-                        if (result.error) {
-                            console.error("AnkiConnect guiBrowse Error:", result.error);
-                            // 可以在这里给用户一些反馈，比如一个短暂的提示
+                    data: JSON.stringify(browsePayload),
+                    onload: function (response) {
+                        if (response.status === 200) {
+                            try {
+                                const result = JSON.parse(response.responseText);
+                                if (result.error) {
+                                    console.error("AnkiConnect guiBrowse Error:", result.error);
+                                } else {
+                                    console.log("Successfully opened Anki browser to note:", noteId);
+                                }
+                            } catch (err) {
+                                console.error("JSON解析失败:", err);
+                            }
                         } else {
-                            console.log("Successfully opened Anki browser to note:", noteId);
+                            console.error("AnkiConnect请求失败:", response.status, response.statusText);
                         }
-                    })
-                    .catch(err => {
-                        console.error("Fetch Error for guiBrowse:", err);
-                    });
+                    },
+                    onerror: function (error) {
+                        console.error("AnkiConnect连接错误:", error);
+                    }
+                });
             };
+            function renderLabels(labels) {
+                if (!labels || !Array.isArray(labels)) return '';
+                return labels
+                    .map(l => `<span class="label">${l}</span>`)
+                    .join(' ');
+            }
             if (btn) {
                 btn.onclick = async () => {
                     btn.style.backgroundColor = "#f1c40f"; // 黄色：发送中
@@ -982,12 +1095,16 @@ else, 如果用户提供的phrase是一个句子, 或者不完整的句子, 并�
                         params: {
                             note: {
                                 deckName: "read",
-                                modelName: "collex",
+                                modelName: "collex 2",
                                 fields: {
                                     word: info.word || '',
                                     pre: info.pre || '',
                                     post: info.post || '',
-                                    meaning: Utils.wrapHTML(info.meaning) || '',
+                                    lemma: info.lemma || '',
+                                    reading: info.reading || '',
+                                    labels: renderLabels(info.labels),
+                                    meaning: info.meaning || '',
+                                    meaning_chinese: info.meaning_chinese || '',
                                     url: info.url || '',
                                     title: info.title || '',
                                     favicon: info.favicon || '',
@@ -997,36 +1114,40 @@ else, 如果用户提供的phrase是一个句子, 或者不完整的句子, 并�
                     };
 
                     try {
-                        const response = await fetch("http://127.0.0.1:8765", {
-                            method: "POST",
-                            headers: { "Content-Type": "application/json" },
-                            body: JSON.stringify(payload)
+                        // 修改：使用 GM_xmlhttpRequest 替代 fetch
+                        const result = await new Promise((resolve, reject) => {
+                            GM_xmlhttpRequest({
+                                method: "POST",
+                                url: "http://127.0.0.1:8765",
+                                headers: { "Content-Type": "application/json" },
+                                data: JSON.stringify(payload),
+                                onload: function (response) {
+                                    if (response.status === 200) {
+                                        try {
+                                            const data = JSON.parse(response.responseText);
+                                            resolve(data);
+                                        } catch (err) {
+                                            reject(new Error(`JSON解析失败: ${err.message}`));
+                                        }
+                                    } else {
+                                        reject(new Error(`HTTP ${response.status}: ${response.statusText}`));
+                                    }
+                                },
+                                onerror: function (error) {
+                                    reject(new Error(`连接失败: ${error.statusText || error.message}`));
+                                }
+                            });
                         });
-                        const result = await response.json();
 
                         if (result.error) {
                             console.error("AnkiConnect Error:", result.error);
                             btn.style.backgroundColor = "#e74c3c"; // 红色：失败
                             btn.textContent = "添加失败";
                         } else {
-                            // 🚀 成功处理部分的关键修改
-                            const newNoteId = result.result; // AnkiConnect 成功返回 noteId
+                            const newNoteId = result.result;
 
                             btn.style.backgroundColor = "#2ecc71"; // 绿色：成功
                             btn.textContent = "添加成功, 点击查看";
-
-                            // 移除旧的点击事件监听器（如果它还存在）
-                            // 注意：为了简单，这里直接用新的替换，但如果需要防止内存泄漏，
-                            // 更好的做法是在添加新的监听器前移除旧的，或者使用一次性监听器。
-
-                            // 移除旧的（发送）事件监听器
-                            // 由于您在函数作用域内，直接替换其功能更简单:
-                            // btn.onclick = null; // 清除当前行内或绑定的任何 click 处理器
-
-                            // // 绑定新的点击事件：打开 Anki
-                            // btn.addEventListener("click", () => {
-                            //     openAnkiNote(newNoteId);
-                            // }, { once: true }); // 使用 once: true 确保只绑定一次
 
                             btn.onclick = () => openAnkiNote(newNoteId)
                         }
@@ -1227,9 +1348,10 @@ else, 如果用户提供的phrase是一个句子, 或者不完整的句子, 并�
         static init(isDebugEnabled) {
             this.isDebugEnabled = isDebugEnabled;
         }
-        static debug_log(msg) {
+        static debug_log(msg, ...args) {
             if (this.isDebugEnabled()) {
                 console.log(`Collex Debug > ${msg}`);
+                console.log(...args);
             }
         }
         static isTargetInInput(target) {
@@ -1253,6 +1375,65 @@ else, 如果用户提供的phrase是一个句子, 或者不完整的句子, 并�
                 favicon: document.querySelector('link[rel~="icon"]')?.href || '',
             };
         }
+
+        static askAI(model, messages, options = {}) {
+            const API_KEY = "请填入你自己的apikey";
+            const API_URL = "https://api.deepseek.com/chat/completions";
+
+            const body = {
+                model,
+                messages,
+                max_tokens: options.max_tokens ?? 500,
+                temperature: options.temperature ?? 0.5,
+                stream: false
+            };
+
+            return new Promise((resolve, reject) => {
+                GM_xmlhttpRequest({
+                    method: "POST",
+                    url: API_URL,
+                    headers: {
+                        "Content-Type": "application/json",
+                        "Authorization": `Bearer ${API_KEY}`
+                    },
+                    data: JSON.stringify(body),
+                    onload: function (response) {
+                        if (response.status === 200) {
+                            try {
+                                const data = JSON.parse(response.responseText);
+                                const content = data.choices[0]?.message?.content?.trim();
+
+                                if (!content) {
+                                    reject(new Error("响应内容为空"));
+                                } else {
+                                    resolve(content);
+                                }
+                            } catch (err) {
+                                Utils.debug_log(`[Utils.askAI] JSON解析失败: ${err}`);
+                                reject(new Error(`JSON解析失败: ${err.message}`));
+                            }
+                        } else {
+                            const errorMsg = `API请求失败: ${response.status} ${response.statusText}`;
+                            Utils.debug_log(`[Utils.askAI] ${errorMsg}`);
+                            reject(new Error(errorMsg));
+                        }
+                    },
+                    onerror: function (error) {
+                        Utils.debug_log(`[Utils.askAI] 网络请求失败: ${error}`);
+                        reject(new Error(`网络请求失败: ${error.statusText || error.message}`));
+                    },
+                    ontimeout: function () {
+                        const errorMsg = "请求超时";
+                        Utils.debug_log(`[Utils.askAI] ${errorMsg}`);
+                        reject(new Error(errorMsg));
+                    }
+                });
+            }).catch(err => {
+                Utils.debug_log(`[Utils.askAI] 调用AI接口失败: ${err}`);
+                return `请求失败: ${err.message}`;
+            });
+        }
+
         /**
          * 将字符串用<div>标签包裹，并将每段用<p>标签包裹
          * 
