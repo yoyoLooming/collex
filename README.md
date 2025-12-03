@@ -6,30 +6,6 @@
 
 采词是一个tampermonkey脚本. 以后有计划实现chrome和firefox浏览器扩展的版本.
 
-# Usage
-
-使用方法..balabala.
-
-暂时懒得写, 安装这个脚本, 自己探索一下吧.
-
-# Anki Integratation
-
-这个插件可以向anki中添加卡片.
-
-## Ankiconnect 安装与配置
-
-安装
-
-配置cors
-
-## anki 卡片模板
-
-效果图如下:
-
-![collex 卡片模板 预览](/assets/collex_preview.png)
-
-我放在 `/anki-models/collex.apkg` 这里了
-
 # 更新日志
 
 - 25/08/09  v0.1    增加监听事件;
@@ -65,3 +41,33 @@
 - [优化] 编写其他的查词来源(除了当前的deepseek)
 - [功能] 支持用户自定义查词来源函数.
 - [优化] 增加一个手动模式, 复制单词, 句子, 甚至截图, 以应对无法提取出句子的时候.
+- [功能] 支持PDF, 通过截图, 和手动输入原词来实现. 也许会集成文字识别.
+
+# Usage
+
+使用方法..balabala.
+
+暂时懒得写, 安装这个脚本, 自己探索一下吧.
+
+
+# Anki Integratation
+
+这个插件可以向anki中添加卡片.
+
+## Ankiconnect 安装与配置
+
+安装
+
+配置cors
+
+## anki 卡片模板
+
+卡片模板在 `/templates/` 里面
+
+collex v2 效果图如下:
+
+![collex 2 卡片模板 预览](/assets/collex_2_preview.png)
+
+collex v1 效果图如下:
+
+![collex 卡片模板 预览](/assets/collex_preview.png)
