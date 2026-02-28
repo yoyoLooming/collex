@@ -49,6 +49,8 @@
 
 暂时懒得写, 安装这个脚本, 自己探索一下吧.
 
+大概就是在chrome或firefox上安装一个tampermonkey/greasymonkey/violentmonkey, 并新建脚本, 粘贴collex.user.js, 或者从磁盘导入这个文件. 我的查词来源中还有一个是 词源. 这个来自于[github mdxserver](https://github.com/ninja33/mdx-server), 运行, 选取etym.mdx就好.
+
 
 # Anki Integratation
 
