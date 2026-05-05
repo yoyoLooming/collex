@@ -206,7 +206,12 @@
 
 {
   "labels": ["...", "...", "...", ...],  # (有多少写多少, 不用加)
-  "examples": ["...", "...", "..."],
+  "examples": [
+  {
+    "en": "...",
+    "zh": "..."
+  }
+],
   "lemma": "...",
   "reading": "...",
   "meaning": "...",
@@ -217,7 +222,13 @@
 字段要求如下：
 
 - lemma：单词的原型, 但不要改变它的词性.（如 reflected → reflect，memories → memory, 而moving出现为形容词时不要还原成move, 或者作为补语时的现在分词, 非谓语动词时则一定要还原成move. 或者moved作为形容词时是moved, 作为过去分词作补语时要还原成move）
-- examples：数组形式，返回 ${this.getSetting('numExamples') ?? 3} 个英文例句。例句应使用 lemma 的该语境义项，难度自然，适合 Anki 记忆；如果数量为 0，则返回空数组 []。
+- examples：数组形式，返回 ${this.getSetting('numExamples') ?? 3} 个例句。
+    例句应使用 lemma 的该语境义项，难度自然，适合 Anki 记忆；如果数量为 0，则返回空数组 []。
+    每个例句是对象：
+    {
+      "en": 英文例句，
+      "zh": 中文翻译
+    }
 - reading：该词最常见的 IPA 音标，使用国际音标格式，例如 "/rɪˈflekt/", 记得要和lemma保持一致.
 - labels：数组形式，依次包含：
     1. 词性标签（如 "v.", "n.", "adj."）
@@ -981,7 +992,13 @@
                         <ol style="color: #555; line-height: 1.6; padding-left: 20px;">
                             ${info.examples
                                 .filter(e => e && e.trim())
-                                .map(e => `<li>${this.escapeHtml(e)}</li>`)
+                                .map(e =>  
+`<li>
+    <div>${this.escapeHtml(e.en)}</div>
+    <div style="color:#999;font-size:12px;">
+        ${this.escapeHtml(e.zh)}
+    </div>
+</li>`)
                                 .join('')}
                         </ol>
                     </div>
@@ -1094,6 +1111,19 @@
                     .filter(l => l && l.trim()) // 过滤掉空值
                     .map(l => `<span class="label">${l}</span>`)
                     .join(' ');
+            }
+            function renderExamples(examples) {
+                if (!examples || !Array.isArray(examples)) return '';
+
+                return examples
+                    .filter(e => e && e.en && e.en.trim())
+                    .map(e => `
+                        <div class="example">
+                            <div>📘<div class="example-en" style="display:inline">${e.en}</div></div>
+                            <div>📙 ${e.zh ? `<div class="example-cn cn-text" style="display:none;">${e.zh}</div>` : ''}</div>
+                        </div>
+                    `)
+                    .join('');
             }
             if (btn) {
                 btn.onclick = async () => {
