@@ -1,6 +1,6 @@
 // ==UserScript==
 // @name         采词
-// @version      1.0.1
+// @version      1.0.4
 // @description  可以在阅读中学习单词.
 // @match        *://*/*
 // @grant        GM_getValue
@@ -50,6 +50,10 @@
  *                    修改了anki卡片模板 (现在是使用 collex 2)
  *                    修改了卡片出现位置逻辑
  *  25/12/01  v1.0.1  小改动, 增加词源的查询
+ *  25/12/01  v1.0.1  小改动, 增加词源的查询
+ *  26/05/05  v1.0.2  小改动, 增加了Nuance和Example的查询
+ *  26/05/05  v1.0.3  小改动, 增加了例句中文
+ *  26/05/05  v1.0.4  增加了apikey的设置, 终于不用在代码中硬编码了.
 任务
 
 1. [功能]用户可以自定义查词的脚本
@@ -253,7 +257,9 @@
                     { role: "user", content: prompt }
                 ];
 
-                const json_promise = Utils.askAI("deepseek-chat", messages, { max_tokens: 900 });
+                const json_promise = Utils.askAI("deepseek-chat", messages, {
+                    max_tokens: 900 ,
+                    apiKey: this.getSetting('apiKey')});
 
                 return json_promise;
 
@@ -299,6 +305,7 @@
                 enableHoverSelection: true,
                 enableDebugMode: false,
                 numExamples: 3,
+                apiKey: '',
             };
             this.settings = {};
         }
@@ -367,6 +374,14 @@
                     alert('请输入非负整数');
                 }
             }, { id: 'set-num-examples' });
+            GM_registerMenuCommand(`设置 API Key (${this.get('apiKey') ? '已设置' : '未设置'})`, () => {
+                const key = prompt('请输入 DeepSeek API Key', this.get('apiKey') || '');
+
+                if (key !== null) {
+                    this.set('apiKey', key.trim());
+                    this.registerMenus();
+                }
+            }, { id: 'set-api-key' });
         }
 
         // 便捷方法
@@ -991,7 +1006,7 @@
                         <div style="font-weight: bold; margin-bottom: 8px; color: #333;">例句</div>
                         <ol style="color: #555; line-height: 1.6; padding-left: 20px;">
                             ${info.examples
-                                .filter(e => e && e.trim())
+                                .filter(e => e && typeof e.en === 'string' && e.en.trim())
                                 .map(e =>  
 `<li>
     <div>${this.escapeHtml(e.en)}</div>
@@ -1423,6 +1438,11 @@
         }
 
         static askAI(model, messages, options = {}) {
+            const API_KEY = options.apiKey || '';
+
+            if (!API_KEY) {
+                return Promise.resolve('请求失败: 未设置 API Key');
+            }
             const API_URL = "https://api.deepseek.com/chat/completions";
 
             const body = {
