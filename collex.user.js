@@ -1,6 +1,6 @@
 // ==UserScript==
 // @name         采词
-// @version      1.0
+// @version      1.0.1
 // @description  可以在阅读中学习单词.
 // @match        *://*/*
 // @grant        GM_getValue
@@ -49,20 +49,25 @@
  *                    修改了查词的prompt
  *                    修改了anki卡片模板 (现在是使用 collex 2)
  *                    修改了卡片出现位置逻辑
-
+ *  25/12/01  v1.0.1  小改动, 增加词源的查询
 任务
 
-- [优化] 将项目优化成更适合初见的样子, 变得一键可运行.
-- [优化] 也许可以增加在卡片上编辑原句的功能, 可以修改pre和post, 至少可以增加.
-- [优化] 支持chrome和firefox的扩展/插件.
-- [优化] 编写其他的查词来源(除了当前的deepseek)
-- [功能] 支持用户自定义查词来源函数.
-- [优化] 增加一个手动模式, 复制单词, 句子, 甚至截图, 以应对无法提取出句子的时候.
+1. [功能]用户可以自定义查词的脚本
+2. [优化](没什么用)给卡片的三个小方块加一点点特效, 鼠标悬浮时, 红方块颜色变深, 蓝方块移动, 黄方块改变形状
+3. [优化]以后再说啦, 改写成浏览器的插件, 火狐和chrome.
+4. [优化]也许总有无法提取出句子的时候, 可以加一个手动模式, 复制单词, 句子, 甚至截图.
+5. [优化]将项目优化成更适合初见的样子, 变得一键可运行.
 
- */
+*/
 
 (function () {
     'use strict';
+    const API_KEY = ''
+    if (window.trustedTypes && window.trustedTypes.createPolicy) {
+        window.trustedTypes.createPolicy('default', {
+            createHTML: (string) => string 
+        });
+    }
 
     class CollexApp {
         constructor() {
@@ -105,7 +110,7 @@
             this.queryWord(wordRange)
         }
 
-        async queryWord(range) {
+        queryWord(range) {
             Utils.debug_log('[app] [query range]' + range.toString())
             const pos = this.rangeManager.getSelectionCorners()
 
@@ -116,16 +121,18 @@
                 dict_promise: null,
                 lemma: null,
                 reading: null,
-                lables: null,
+                labels: null,
+                examples: null,
                 meaning: null,
                 meaning_chinese: null,
+                nuance: null,
                 url: null,
                 title: null,
                 favicon: null,
             };
             Object.assign(info, this.rangeManager.extractContext(range))
             Object.assign(info, Utils.collectContext())
-            info.dict_promise = this.dictManager.dict_ai(info)
+            info.dict_promise = this.dictManager.query(info)
             this.cardManager.createCard(pos, info)
         }
     };
@@ -133,18 +140,53 @@
      * 词典管理
      */
     class DictManager {
-        query(context) {
-            /* context = {
-                pre: null,
-                word: null,
-                post: null,
-                url: null,
-                title: null,
-                favicon: null,
-            };
-            */
-            // {meaning_promise, metainfo_promise}"
-            return this.dict_ai(context);
+        constructor(getSetting) {
+            this.getSetting = getSetting;
+        }
+        async query(context) {
+            let query_result = {};
+
+            // 从 ai 获取原词, 释义, 音标...
+            const data = JSON.parse(this.cleanJson(await this.dict_ai(context)))
+
+            query_result.lemma = data.lemma;
+            query_result.reading = data.reading;
+            query_result.labels = data.labels;
+            query_result.examples = data.examples;
+            query_result.meaning = data.meaning;
+            query_result.meaning_chinese = data.meaning_chinese;
+            query_result.nuance = data.nuance;
+
+            // 从 mdx server 获取词源
+            const lemma = query_result.lemma || context.word;
+            const etymology = await new Promise(resolve => {
+                GM_xmlhttpRequest({
+                    method: "GET",
+                    url: `http://localhost:8000/${lemma}`,
+                    onload: (response) => resolve(response.responseText),
+                    onerror: () => resolve("词源获取失败")
+                });
+            });
+            if (etymology.indexOf('server error occurred.') === -1) {
+                query_result.etymology = this.cleanEtymologyHTML(etymology);
+            }
+            return query_result;
+        }
+        cleanJson(raw) {
+            if (typeof raw !== "string") return raw;
+
+            // 去掉 ```json 和 ```（包括可能有的空格）
+            return raw
+                .replace(/```json\s*/i, "")
+                .replace(/```/g, "")
+                .trim();
+        }
+        cleanEtymologyHTML(html) {
+            return html
+                .replace(/<link[^>]*>/g, '')
+                .replace(/<script[^>]*>[\s\S]*?<\/script>/g, '')
+                .replace(/<a[^>]*>([^<]*)<\/a>/g, '$1')
+                .replace(/ class="[^"]*"/g, '');
         }
         dict_ai(context) {
             try {
@@ -163,29 +205,34 @@
 你的任务是根据语境推断该单词在句子中的含义，并按以下 JSON 格式输出：
 
 {
+  "labels": ["...", "...", "...", ...],  # (有多少写多少, 不用加)
+  "examples": ["...", "...", "..."],
   "lemma": "...",
   "reading": "...",
-  "labels": ["...", "...", "..."],
   "meaning": "...",
-  "meaning_chinese": "..."
+  "meaning_chinese": "...",
+  "nuance": "...",
 }
 
 字段要求如下：
 
-- lemma：单词的原型（如 reflected → reflect，memories → memory）
-- reading：该词最常见的 IPA 音标，使用国际音标格式，例如 "/rɪˈflekt/"
+- lemma：单词的原型, 但不要改变它的词性.（如 reflected → reflect，memories → memory, 而moving出现为形容词时不要还原成move, 或者作为补语时的现在分词, 非谓语动词时则一定要还原成move. 或者moved作为形容词时是moved, 作为过去分词作补语时要还原成move）
+- examples：数组形式，返回 ${this.getSetting('numExamples') ?? 3} 个英文例句。例句应使用 lemma 的该语境义项，难度自然，适合 Anki 记忆；如果数量为 0，则返回空数组 []。
+- reading：该词最常见的 IPA 音标，使用国际音标格式，例如 "/rɪˈflekt/", 记得要和lemma保持一致.
 - labels：数组形式，依次包含：
     1. 词性标签（如 "v.", "n.", "adj."）
     2. 语域标签（formal / informal / slang / literary / technical 等，若无可省略）
     3. 语法标签（如 [T], [I], [C], [U]）
-- meaning：英文释义，用 vocabulary.com 风格，通俗、自然
-- meaning_chinese：中文释义，简洁，一两个词即可
+- meaning：根据句子语境选择该词的正确含义，但用通用、可泛用的英文表达该义项，不要包含具体语境信息（如专有名词、具体场景），保持简洁
+- meaning_chinese: 简洁的中文释义, 一两个词.
+- nuance: 用简短英文说明该词的语气、使用特点或与常见近义词的区别（不超过 10 个词）
 
 请只返回 JSON，不要返回额外解释。
 
 用户输入：
 单词：${context.word}
 句子："${fullSentence}"
+例句数量：${this.getSetting('numExamples') ?? 3}
 网页标题：${context.title || '（无）'}
         `;
 
@@ -195,7 +242,7 @@
                     { role: "user", content: prompt }
                 ];
 
-                const json_promise = Utils.askAI("deepseek-chat", messages, { max_tokens: 500 });
+                const json_promise = Utils.askAI("deepseek-chat", messages, { max_tokens: 900 });
 
                 return json_promise;
 
@@ -204,79 +251,6 @@
                 return `无法获取"${context.word}"的信息。错误: ${error.message}`
             }
         }
-
-        //         dict_ai(context) {
-        //             try {
-        //                 const fullSentence = `${context.pre || ''} [ ${context.word} ] ${context.post || ''}`.trim();
-
-        //                 // 1️⃣ 第一次请求：语义解释
-        //                 let explainPrompt = `"${fullSentence}"\n请解释上面句子中"${context.word}"这个词的含义。\n`;
-        //                 if (context.title) explainPrompt += `\n\n网页标题为: ${context.title}`
-
-        //                 const explainMessages = [
-        //                     {
-        //                         role: "system",
-        //                         content: `
-        // 你是一个专业的语言教师，专注于提供单词在具体语境中的准确解释。
-        // 请解释用户向你查询的单词. 用户会提供他遇到这个单词时的语境, 你提供的单词释义应当是语境中出现时的那个释义.
-        // 请先提供英语的解释
-        // 再提供中文的解释. 
-        // 其中, 英文的解释我想要vocabulary.com风格的. 中文的解释简洁一些就好, 要像词汇书中用一两个词语来解释, 而不是像对话一样说很多.
-        // 我希望输出结果不要带有markdown记号, 而是用<div>包裹, 并且其中每一个段落都用<p>包裹, 并且不要有任何样式. 
-
-        // `
-        //                     },
-        //                     { role: "user", content: explainPrompt }
-        //                 ];
-
-        //                 const meaning_promise = Utils.askAI("deepseek-chat", explainMessages, { max_tokens: 500 });
-
-        //                 // 2️⃣ 第二次请求：词性、语域、语法标签分析
-        //                 const metaPrompt = `
-        // 请分析以下单词:
-        // "${context.word}" (出现在句子: "${fullSentence}")
-
-        // 请提供:
-        // - 原型 (lemma), 比如annoying, 如果在语境中是形容词就提供给我annoying, 如果是动词就提供给我annoy
-        // - 词性标签 (POS)
-        // - 语域或文体标签 (register/style): formal, informal, slang, literary, archaic, technical...
-        // - 语法标签 (grammar): [T], [I], [U], [C] (表示动词是否及物, 名词是否可数等)
-
-        // 示例格式:
-        // abide v. formal
-        // kiddo n. informal
-        // reckon v. chiefly British, informal
-        // thus adv. formal, literary
-        // ...
-
-        // 请使用如下HTML结构输出（无样式）:
-        // <div class="dict-meta">
-        //   <div class="word">${context.word}</div>
-        //   <div class="tags-container">
-        //     <span class="meta-label pos-label ">v.</span>
-        //     <span class="meta-label register-label ">informal</span> 
-        //     <span class="meta-label grammar-label ">[T]</span> 
-        //   </div>
-        // </div>
-        //         `;
-
-        //                 const metaMessages = [
-        //                     { role: "system", content: "你是一个英语语言学专家，专注于词性与语域分析。" },
-        //                     { role: "user", content: metaPrompt }
-        //                 ];
-
-        //                 const metainfo_promise = Utils.askAI("deepseek-chat", metaMessages, { max_tokens: 300 });
-
-        //                 return { meaning_promise, metainfo_promise };
-
-        //             } catch (error) {
-        //                 Utils.debug_log("[dict manager] 调用dict_ai出错:" + error);
-        //                 return {
-        //                     meaning_promise: `无法获取"${context.word}"的解释。错误: ${error.message}`,
-        //                     metainfo_promise: ""
-        //                 };
-        //             }
-        //         }
 
         /**
          * 查询词典 API
@@ -312,7 +286,8 @@
                 hotkey: 'Control',
                 enableMouseSelection: true,
                 enableHoverSelection: true,
-                enableDebugMode: false
+                enableDebugMode: false,
+                numExamples: 3,
             };
             this.settings = {};
         }
@@ -370,6 +345,17 @@
                     this.registerMenus();
                 }
             }, { id: 'set-hotkey' });
+            GM_registerMenuCommand(`设置例句数量 (当前: ${this.get('numExamples')})`, () => {
+                const value = prompt('请输入例句数量，例如 0 / 1 / 3 / 5', this.get('numExamples'));
+                const num = Number(value);
+
+                if (Number.isInteger(num) && num >= 0) {
+                    this.set('numExamples', num);
+                    this.registerMenus();
+                } else {
+                    alert('请输入非负整数');
+                }
+            }, { id: 'set-num-examples' });
         }
 
         // 便捷方法
@@ -765,7 +751,7 @@
             this.exists = true;
         }
         showLoading() {
-            this.contentElement.innerHTML = `
+            let html = `
             <div style="display: flex; justify-content: center; align-items: center; height: 100%;">
                 <div style="text-align: center;">
                     <div style="margin-bottom: 8px;">加载中...</div>
@@ -779,6 +765,7 @@
                 }
             </style>
         `;
+        this.contentElement.innerHTML = html
         }
         create(pos) {
 
@@ -943,25 +930,18 @@
         }
 
         async renderContent(info) {
-            function cleanJson(raw) {
-                if (typeof raw !== "string") return raw;
-
-                // 去掉 ```json 和 ```（包括可能有的空格）
-                return raw
-                    .replace(/```json\s*/i, "")
-                    .replace(/```/g, "")
-                    .trim();
-            }
-            const res = await info.dict_promise;
-            const data = JSON.parse(cleanJson(res))
+            const data = await info.dict_promise;
 
             Utils.debug_log('[render parse]', data)
 
             info.lemma = data.lemma;
             info.reading = data.reading;
             info.labels = data.labels;
+            info.examples = data.examples;
             info.meaning = data.meaning;
             info.meaning_chinese = data.meaning_chinese;
+            info.nuance = data.nuance;
+            info.etymology = data.etymology; // 直接保存 etymology HTML 内容
 
             Utils.debug_log("[card manager] [info]", info)
             let contentHTML = '';
@@ -979,17 +959,45 @@
                     </div>
                 `;
             }
-
+            
             // ======= 释义（英文 / 中文） =======
-            if (info.meaning || info.meaning_chinese) {
+            if (info.meaning || info.meaning_chinese || info.nuance) {
                 contentHTML += `
                     <div style="margin-bottom: 16px;">
                         <div style="font-weight: bold; margin-bottom: 8px; color: #333;">释义</div>
                         ${info.meaning ? `<div style="color: #555; margin-bottom: 6px;">${this.escapeHtml(info.meaning)}</div>` : ""}
                         ${info.meaning_chinese ? `<div style="color: #777;">${this.escapeHtml(info.meaning_chinese)}</div>` : ""}
+                        ${info.nuance ? `<div style="color: #999;">${this.escapeHtml(info.nuance)}</div>` : ""}
+
                     </div>
                 `;
             }
+
+            // ======= 例句（英文 / 中文） =======
+            if (info.examples && Array.isArray(info.examples) && info.examples.length > 0) {
+                contentHTML += `
+                    <div style="margin-bottom: 16px;">
+                        <div style="font-weight: bold; margin-bottom: 8px; color: #333;">例句</div>
+                        <ol style="color: #555; line-height: 1.6; padding-left: 20px;">
+                            ${info.examples
+                                .filter(e => e && e.trim())
+                                .map(e => `<li>${this.escapeHtml(e)}</li>`)
+                                .join('')}
+                        </ol>
+                    </div>
+                `;
+            }
+
+            contentHTML += `
+                <div style="margin-top: 20px; text-align: center;">
+                    <button id="add-to-anki-btn"
+                        style="background-color: #007cba; color: white; border: none;
+                            padding: 8px 16px; border-radius: 5px; cursor: pointer;
+                            transition: background-color 0.3s;">
+                        添加到 Anki
+                    </button>
+                </div>
+            `;
 
             // ======= 原句区 =======
             contentHTML += `
@@ -1002,6 +1010,18 @@
                     ${info.post ? `<span style="color: #666;">${this.escapeHtml(info.post)}</span>` : ""}
                 </div>
             `;
+
+            // ======= 词源信息 =======
+            if (info.etymology) {
+                contentHTML += `
+        <div style="margin-bottom: 16px;">
+            <div style="font-weight: bold; margin-bottom: 8px; color: #333;">词源</div>
+            <div style="color: #555; font-size: 14px; line-height: 1.5;">
+                ${info.etymology}
+            </div>
+        </div>
+    `;
+            }
 
             // ======= 网页信息（title + url + favicon） =======
             if (info.title || info.url || info.favicon) {
@@ -1028,17 +1048,6 @@
                 `;
             }
 
-
-            contentHTML += `
-                <div style="margin-top: 20px; text-align: center;">
-                    <button id="add-to-anki-btn"
-                        style="background-color: #007cba; color: white; border: none;
-                            padding: 8px 16px; border-radius: 5px; cursor: pointer;
-                            transition: background-color 0.3s;">
-                        添加到 Anki
-                    </button>
-                </div>
-            `;
             this.contentElement.innerHTML = contentHTML;
 
 
@@ -1082,6 +1091,7 @@
             function renderLabels(labels) {
                 if (!labels || !Array.isArray(labels)) return '';
                 return labels
+                    .filter(l => l && l.trim()) // 过滤掉空值
                     .map(l => `<span class="label">${l}</span>`)
                     .join(' ');
             }
@@ -1103,11 +1113,17 @@
                                     lemma: info.lemma || '',
                                     reading: info.reading || '',
                                     labels: renderLabels(info.labels),
+                                    examples: renderExamples(info.examples),
                                     meaning: info.meaning || '',
                                     meaning_chinese: info.meaning_chinese || '',
+                                    nuance: info.nuance || '',
+                                    etymology: info.etymology || '', // 新增词源字段
                                     url: info.url || '',
                                     title: info.title || '',
                                     favicon: info.favicon || '',
+                                },
+                                "options": {
+                                    "allowDuplicate": true
                                 },
                             }
                         }
@@ -1377,7 +1393,6 @@
         }
 
         static askAI(model, messages, options = {}) {
-            const API_KEY = "请填入你自己的apikey";
             const API_URL = "https://api.deepseek.com/chat/completions";
 
             const body = {
