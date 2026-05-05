@@ -54,6 +54,7 @@
  *  26/05/05  v1.0.2  小改动, 增加了Nuance和Example的查询
  *  26/05/05  v1.0.3  小改动, 增加了例句中文
  *  26/05/05  v1.0.4  增加了apikey的设置, 终于不用在代码中硬编码了.
+ *  26/05/05  v1.0.5  增加了开关词源查询的选项, 因为它依赖于一个本地服务. 用户不想弄的话可以不弄.
 任务
 
 1. [功能]用户可以自定义查词的脚本
@@ -162,18 +163,23 @@
             query_result.nuance = data.nuance;
 
             // 从 mdx server 获取词源
-            const lemma = query_result.lemma || context.word;
-            const etymology = await new Promise(resolve => {
-                GM_xmlhttpRequest({
-                    method: "GET",
-                    url: `http://localhost:8000/${lemma}`,
-                    onload: (response) => resolve(response.responseText),
-                    onerror: () => resolve("词源获取失败")
+            if (this.getSetting('enableEtymology')) {
+
+                const lemma = query_result.lemma || context.word;
+                const etymology = await new Promise(resolve => {
+                    GM_xmlhttpRequest({
+                        method: "GET",
+                        url: `http://localhost:8000/${lemma}`,
+                        onload: (response) => resolve(response.responseText),
+                        onerror: () => resolve("")
+                    });
                 });
-            });
-            if (etymology.indexOf('server error occurred.') === -1) {
-                query_result.etymology = this.cleanEtymologyHTML(etymology);
+
+                if (etymology && etymology.indexOf('server error occurred.') === -1) {
+                    query_result.etymology = this.cleanEtymologyHTML(etymology);
+                }
             }
+
             return query_result;
         }
         cleanJson(raw) {
@@ -306,6 +312,7 @@
                 enableDebugMode: false,
                 numExamples: 3,
                 apiKey: '',
+                enableEtymology: false,
             };
             this.settings = {};
         }
@@ -382,6 +389,10 @@
                     this.registerMenus();
                 }
             }, { id: 'set-api-key' });
+            GM_registerMenuCommand(`启用 词源查询: ${this.get('enableEtymology') ? '✅' : '❌'}`, () => {
+                this.toggle('enableEtymology');
+                this.registerMenus();
+            }, { id: 'enable-etymology' });
         }
 
         // 便捷方法
@@ -1134,7 +1145,7 @@
                     .filter(e => e && e.en && e.en.trim())
                     .map(e => `
                         <div class="example">
-                            <div>📘<div class="example-en" style="display:inline">${e.en}</div></div>
+                            <div>📘 <div class="example-en" style="display:inline">${e.en}</div></div>
                             <div>📙 ${e.zh ? `<div class="example-cn cn-text" style="display:none;">${e.zh}</div>` : ''}</div>
                         </div>
                     `)
